@@ -1,0 +1,31 @@
+# Secrets — never commit
+.env
+service_account.json
+*.json.key
+client_secret*.json
+
+# Logs / runtime
+*.log
+bot_run.log
+
+# Claude / local tooling — never push
+.claude/
+# temp/test scripts (but keep package __init__.py files)
+_*.py
+!**/__init__.py
+
+# Database (contains encrypted tokens + user data)
+*.db
+*.db-journal
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

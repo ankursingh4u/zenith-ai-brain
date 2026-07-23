@@ -1,0 +1,20 @@
+# --- Core ---
+python-telegram-bot==21.6        # Telegram bot (async, long-polling)
+openai==1.54.0                   # The "brain" (function calling)
+httpx==0.27.2                    # pinned: openai 1.54 is incompatible with httpx>=0.28
+SQLAlchemy==2.0.35               # Database ORM
+cryptography==43.0.1             # Fernet encryption for stored tokens
+python-dotenv==1.0.1             # Load .env config
+APScheduler==3.10.4              # Scheduled jobs (statements, reminders)
+tzdata==2024.2                   # IANA timezone data (required on Windows)
+pypdf==5.0.1                     # extract text from statement PDFs
+price-parser==0.3.4              # deterministic money-amount extraction (cross-check the AI)
+
+# --- Google login callback server ---
+fastapi==0.115.2
+uvicorn==0.31.0
+
+# --- Google APIs (Gmail / Sheets / Drive) ---
+google-auth==2.35.0
+google-auth-oauthlib==1.2.1
+google-api-python-client==2.147.0
