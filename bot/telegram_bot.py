@@ -298,6 +298,25 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await ctx.bot.send_message(chat_id, "Couldn't find that account.")
 
 
+async def accounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Quick account switcher: list linked Google accounts + Add/Switch/Remove buttons."""
+    if not await _gate(update):
+        return
+    uid = update.effective_user.id
+    db.get_or_create_user(uid, update.effective_user.full_name)
+    accts = db.list_google_accounts(uid)
+    default = db.get_default_account(uid)
+    if not accts:
+        return await update.message.reply_text(
+            "You haven't linked any Google account yet. Tap ➕ to add one.",
+            reply_markup=_accounts_keyboard(uid))
+    lines = ["📧 Your Google accounts:"]
+    for a in accts:
+        lines.append(f"• {a.email}" + ("  ⭐ default (used for mail/drive/etc.)" if a.email == default else ""))
+    lines.append("\nTap 🔄 to change which account I use, or ➕ to add another.")
+    await update.message.reply_text("\n".join(lines), reply_markup=_accounts_keyboard(uid))
+
+
 async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _gate(update):
         return
@@ -445,6 +464,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("connect", connect))
+    app.add_handler(CommandHandler("accounts", accounts))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("checknow", checknow))
     app.add_handler(CallbackQueryHandler(on_callback))
