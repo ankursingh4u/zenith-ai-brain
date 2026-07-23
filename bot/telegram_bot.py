@@ -297,6 +297,36 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             await ctx.bot.send_message(chat_id, "Couldn't find that account.")
 
+    # --- Google Sheet management ---
+    elif data == "sheet:add":
+        await ctx.bot.send_message(chat_id, tools.sheet_setup_help(uid), disable_web_page_preview=True)
+    elif data == "sheet:setdef":
+        rows = db.list_sheets(uid)
+        if not rows:
+            return await ctx.bot.send_message(chat_id, "No sheets connected yet.")
+        kb = [[InlineKeyboardButton(r.title or "Sheet", callback_data=f"sds:{r.sheet_id}")] for r in rows]
+        await ctx.bot.send_message(chat_id, "Pick your default sheet (entries save here):",
+                                   reply_markup=InlineKeyboardMarkup(kb))
+    elif data.startswith("sds:"):
+        sid = data[4:]
+        if db.set_default_sheet(uid, sid):
+            await ctx.bot.send_message(chat_id, "⭐ Default sheet updated. New entries go here.")
+        else:
+            await ctx.bot.send_message(chat_id, "That sheet isn't connected anymore.")
+    elif data == "sheet:remove":
+        rows = db.list_sheets(uid)
+        if not rows:
+            return await ctx.bot.send_message(chat_id, "No sheets to remove.")
+        kb = [[InlineKeyboardButton(f"🗑 {r.title or 'Sheet'}", callback_data=f"rms:{r.sheet_id}")] for r in rows]
+        await ctx.bot.send_message(chat_id, "Pick a sheet to disconnect:",
+                                   reply_markup=InlineKeyboardMarkup(kb))
+    elif data.startswith("rms:"):
+        sid = data[4:]
+        if db.remove_sheet(uid, sid):
+            await ctx.bot.send_message(chat_id, "🗑 Sheet disconnected. (The sheet in your Google Drive is untouched.)")
+        else:
+            await ctx.bot.send_message(chat_id, "Couldn't find that sheet.")
+
 
 async def accounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Quick account switcher: list linked Google accounts + Add/Switch/Remove buttons."""
@@ -315,6 +345,35 @@ async def accounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(f"• {a.email}" + ("  ⭐ default (used for mail/drive/etc.)" if a.email == default else ""))
     lines.append("\nTap 🔄 to change which account I use, or ➕ to add another.")
     await update.message.reply_text("\n".join(lines), reply_markup=_accounts_keyboard(uid))
+
+
+def _sheets_keyboard(uid: int) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("➕ Add a sheet", callback_data="sheet:add")]]
+    n = db.count_sheets(uid)
+    if n > 1:
+        rows.append([InlineKeyboardButton("🔄 Change default sheet", callback_data="sheet:setdef")])
+    if n >= 1:
+        rows.append([InlineKeyboardButton("🗑 Remove a sheet", callback_data="sheet:remove")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def sheets_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show connected Google Sheets + Add/Switch/Remove buttons."""
+    if not await _gate(update):
+        return
+    uid = update.effective_user.id
+    db.get_or_create_user(uid, update.effective_user.full_name)
+    rows = db.list_sheets(uid)
+    default = db.default_sheet_id(uid)
+    if not rows:
+        return await update.message.reply_text(
+            "📊 No Google Sheets connected yet.\n\n" + tools.sheet_setup_help(uid),
+            reply_markup=_sheets_keyboard(uid), disable_web_page_preview=True)
+    lines = [f"📊 You have {len(rows)} sheet(s) connected:"]
+    for r in rows:
+        lines.append(f"• {r.title or 'Sheet'}" + ("  ⭐ default (entries saved here)" if r.sheet_id == default else ""))
+    lines.append("\nUse the buttons to add another, switch the default, or remove one.")
+    await update.message.reply_text("\n".join(lines), reply_markup=_sheets_keyboard(uid))
 
 
 async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -454,6 +513,7 @@ async def _post_init(app: Application) -> None:
     await app.bot.set_my_commands([
         BotCommand("start", "What I can do"),
         BotCommand("connect", "Connect a Sheet or your Google account"),
+        BotCommand("sheets", "See or switch your connected Sheets"),
         BotCommand("accounts", "Switch or add Google accounts"),
         BotCommand("status", "See what you have connected"),
         BotCommand("whoami", "Show my Telegram ID"),
@@ -472,6 +532,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("connect", connect))
     app.add_handler(CommandHandler("accounts", accounts))
+    app.add_handler(CommandHandler("sheets", sheets_cmd))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("checknow", checknow))
     app.add_handler(CallbackQueryHandler(on_callback))

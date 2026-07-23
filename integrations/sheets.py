@@ -54,12 +54,15 @@ def register(telegram_id: int, url_or_id: str) -> tuple[bool, str]:
         email = gservice.service_account_email(telegram_id) or "the bot's service account"
         return False, (f"I can't open that sheet yet. In the sheet click Share, add "
                        f"{email} as Editor, then send the link again.")
-    db.set_user_resources(telegram_id, sheet_id=sheet_id)
-    return True, f"✅ Connected your sheet '{detail}'. I'll record entries here now."
+    count = db.add_sheet(telegram_id, sheet_id, detail)
+    if count == 1:
+        return True, f"✅ Connected your sheet '{detail}'. New entries will be saved here."
+    return True, (f"✅ Connected '{detail}'. You now have {count} sheets connected. "
+                  f"Entries go to your default sheet — use /sheets to see them or switch.")
 
 
 def _sheet_id(telegram_id: int) -> str:
-    sheet_id, _ = db.get_user_resources(telegram_id)
+    sheet_id = db.default_sheet_id(telegram_id)
     if not sheet_id:
         raise NoSheet("No sheet registered.")
     return sheet_id

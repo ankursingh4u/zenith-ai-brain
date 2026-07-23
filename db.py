@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import (
-    BigInteger, DateTime, Float, ForeignKey, String, Text, create_engine, select
+    BigInteger, DateTime, Float, ForeignKey, String, Text, create_engine, func, select
 )
 from sqlalchemy.orm import (
     DeclarativeBase, Mapped, Session, mapped_column, relationship
@@ -74,6 +74,20 @@ class GoogleAccount(Base):
     )
     email: Mapped[str] = mapped_column(String(255), nullable=False)
     token_enc: Mapped[str] = mapped_column(Text, nullable=False)     # encrypted OAuth token
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ConnectedSheet(Base):
+    """A Google Sheet the user shared with the bot. A user may connect several."""
+    __tablename__ = "connected_sheets"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    telegram_id: Mapped[int] = mapped_column(
+        ForeignKey("users.telegram_id"), index=True, nullable=False
+    )
+    sheet_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    title: Mapped[Optional[str]] = mapped_column(String(255))
+    is_default: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -175,6 +189,21 @@ _engine = create_engine(config.DATABASE_URL, echo=False)
 def init_db() -> None:
     Base.metadata.create_all(_engine)
     _migrate_add_columns()
+    _migrate_single_sheet()
+
+
+def _migrate_single_sheet() -> None:
+    """Move any legacy single User.sheet_id into the connected_sheets table."""
+    with session() as s:
+        users = s.scalars(select(User).where(User.sheet_id.is_not(None))).all()
+        for u in users:
+            has = s.scalars(select(ConnectedSheet).where(
+                ConnectedSheet.telegram_id == u.telegram_id,
+                ConnectedSheet.sheet_id == u.sheet_id)).first()
+            if not has:
+                s.add(ConnectedSheet(telegram_id=u.telegram_id, sheet_id=u.sheet_id,
+                                     title="My Sheet", is_default=True))
+        s.commit()
 
 
 def _migrate_add_columns() -> None:
@@ -553,12 +582,98 @@ def all_users_with_google() -> list[User]:
 
 
 def get_user_resources(telegram_id: int) -> tuple[str | None, str | None]:
-    """Return (sheet_id, drive_folder_id) for a user."""
+    """Return (default_sheet_id, drive_folder_id) for a user."""
     with session() as s:
         user = s.get(User, telegram_id)
-        if user is None:
-            return None, None
-        return user.sheet_id, user.drive_folder_id
+        folder = user.drive_folder_id if user else None
+    return default_sheet_id(telegram_id), folder
+
+
+# --- Multiple connected sheets -------------------------------------------
+def add_sheet(telegram_id: int, sheet_id: str, title: str | None) -> int:
+    """Add/refresh a connected sheet. First one becomes the default. Returns total count."""
+    with session() as s:
+        existing = s.scalars(select(ConnectedSheet).where(
+            ConnectedSheet.telegram_id == telegram_id,
+            ConnectedSheet.sheet_id == sheet_id)).first()
+        if existing:
+            existing.title = title
+        else:
+            any_sheet = s.scalars(select(ConnectedSheet).where(
+                ConnectedSheet.telegram_id == telegram_id)).first()
+            s.add(ConnectedSheet(telegram_id=telegram_id, sheet_id=sheet_id,
+                                 title=title, is_default=(any_sheet is None)))
+        s.commit()
+        return s.scalar(select(func.count()).select_from(ConnectedSheet).where(
+            ConnectedSheet.telegram_id == telegram_id))
+
+
+def list_sheets(telegram_id: int) -> list["ConnectedSheet"]:
+    with session() as s:
+        rows = s.scalars(select(ConnectedSheet).where(
+            ConnectedSheet.telegram_id == telegram_id).order_by(ConnectedSheet.id)).all()
+        for r in rows:
+            s.expunge(r)
+        return list(rows)
+
+
+def count_sheets(telegram_id: int) -> int:
+    with session() as s:
+        return s.scalar(select(func.count()).select_from(ConnectedSheet).where(
+            ConnectedSheet.telegram_id == telegram_id)) or 0
+
+
+def default_sheet_id(telegram_id: int) -> str | None:
+    with session() as s:
+        row = s.scalars(select(ConnectedSheet).where(
+            ConnectedSheet.telegram_id == telegram_id,
+            ConnectedSheet.is_default.is_(True))).first()
+        if row is None:  # fall back to the first sheet if no default flagged
+            row = s.scalars(select(ConnectedSheet).where(
+                ConnectedSheet.telegram_id == telegram_id).order_by(ConnectedSheet.id)).first()
+        return row.sheet_id if row else None
+
+
+def set_default_sheet(telegram_id: int, sheet_id: str) -> bool:
+    with session() as s:
+        rows = s.scalars(select(ConnectedSheet).where(
+            ConnectedSheet.telegram_id == telegram_id)).all()
+        found = False
+        for r in rows:
+            r.is_default = (r.sheet_id == sheet_id)
+            found = found or r.is_default
+        s.commit()
+        return found
+
+
+def resolve_sheet(telegram_id: int, hint: str) -> str | None:
+    """Find a connected sheet by a partial title match."""
+    with session() as s:
+        rows = s.scalars(select(ConnectedSheet).where(
+            ConnectedSheet.telegram_id == telegram_id)).all()
+        for r in rows:
+            if hint.lower() in (r.title or "").lower():
+                return r.sheet_id
+    return None
+
+
+def remove_sheet(telegram_id: int, sheet_id: str) -> bool:
+    with session() as s:
+        row = s.scalars(select(ConnectedSheet).where(
+            ConnectedSheet.telegram_id == telegram_id,
+            ConnectedSheet.sheet_id == sheet_id)).first()
+        if row is None:
+            return False
+        was_default = row.is_default
+        s.delete(row)
+        s.commit()
+        if was_default:  # promote another to default
+            nxt = s.scalars(select(ConnectedSheet).where(
+                ConnectedSheet.telegram_id == telegram_id).order_by(ConnectedSheet.id)).first()
+            if nxt:
+                nxt.is_default = True
+                s.commit()
+        return True
 
 
 # --- Reminder helpers -----------------------------------------------------

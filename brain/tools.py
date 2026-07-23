@@ -70,8 +70,7 @@ def set_current_message(text: str) -> None:
 
 
 def _has_sheet(telegram_id: int) -> bool:
-    sheet_id, _ = db.get_user_resources(telegram_id)
-    return bool(sheet_id)
+    return db.count_sheets(telegram_id) > 0
 
 
 # =========================================================================
@@ -274,6 +273,17 @@ def register_drive_folder(telegram_id: int, folder_url: str) -> str:
     return msg
 
 
+def list_sheets(telegram_id: int) -> str:
+    rows = db.list_sheets(telegram_id)
+    if not rows:
+        return "No Google Sheets connected yet. Send /connect and share a sheet to add one."
+    default = db.default_sheet_id(telegram_id)
+    lines = [f"📊 You have {len(rows)} sheet(s) connected:"]
+    for r in rows:
+        lines.append(f"• {r.title or 'Sheet'}" + ("  ⭐ default (entries saved here)" if r.sheet_id == default else ""))
+    return "\n".join(lines)
+
+
 def read_sheet(telegram_id: int, limit: int = 100) -> str:
     """Read the user's connected sheet so the AI can reason over their data."""
     if not _has_sheet(telegram_id):
@@ -433,6 +443,7 @@ TOOLS: dict[str, callable] = {
     "sheet_setup_help": sheet_setup_help,
     "register_sheet": register_sheet,
     "register_drive_folder": register_drive_folder,
+    "list_sheets": list_sheets,
     "read_sheet": read_sheet,
     "list_accounts": list_accounts,
     "read_emails": read_emails,
@@ -497,7 +508,8 @@ SCHEMAS: list[dict] = [
         {"sheet_url": {"type": "string", "description": "The Google Sheets URL or id."}}, ["sheet_url"]),
     _fn("register_drive_folder", "Connect a Google Drive folder for saving bill photos. Use when they send a Drive folder link.",
         {"folder_url": {"type": "string", "description": "The Google Drive folder URL or id."}}, ["folder_url"]),
-    _fn("read_sheet", "Read the user's connected sheet so you can answer questions about their data (spending, totals, history).",
+    _fn("list_sheets", "List how many Google Sheets the user has connected and which is the default.", {}),
+    _fn("read_sheet", "Read the user's default connected sheet so you can answer questions about their data (spending, totals, history).",
         {"limit": {"type": "integer", "description": "How many recent rows. Default 100."}}),
 
     _fn("list_accounts", "List the user's linked Google accounts (emails).", {}),
