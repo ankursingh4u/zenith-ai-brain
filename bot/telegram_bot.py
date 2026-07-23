@@ -19,14 +19,21 @@ from integrations import drive, gservice, mailbox, oauth, sheets
 from scheduler.jobs import run_daily_check, start_scheduler
 
 WELCOME = (
-    "🧠 Access granted. I'm *Brain* — your personal assistant & accountant.\n\n"
-    "Here's what I can do — just talk naturally:\n"
-    "💰 Track money — \"paid electricity 2400\", \"received 5000 from client\", \"summary this month\"\n"
-    "⏰ Remind you — \"remind me at 5pm to call the bank\"\n"
-    "🔐 Keep passwords safe (encrypted) — \"save my wifi password\", \"what's my gmail password\"\n"
-    "🧾 Read bill photos — just send a photo, I'll read the amount and log it\n"
-    "📊 Record everything in your own Google Sheet — share your sheet with me and send the link\n"
-    "✏️ Fix mistakes instantly — \"undo that\", \"edit last to 2500\"\n\n"
+    "🧠 Zenith Brain — your personal assistant & accountant.\n"
+    "Just talk to me naturally, no commands needed:\n\n"
+    "💰 Money — \"paid electricity 2400\", \"summary this month\"\n"
+    "⏰ Reminders — \"remind me at 5pm to call the bank\"\n"
+    "🔐 Passwords — \"save my wifi password\", \"what's my gmail password\"\n"
+    "🧾 Bills — send a photo, I read the amount and log it\n"
+    "📧 Email — \"check my email\", \"send a mail to …\"\n"
+    "✏️ Fixes — \"undo that\", \"edit last to 2500\"\n\n"
+    "⚙️ Commands (or tap the ☰ menu next to the message box):\n"
+    "/connect — link a Google Sheet or Google account\n"
+    "/sheets — see or switch your connected Sheets\n"
+    "/accounts — switch or add Google accounts (Gmail/Drive/Docs)\n"
+    "/addmail — connect an email mailbox (Migadu, Zoho, IMAP)\n"
+    "/status — see what you've connected\n"
+    "/help — show this help again\n\n"
     "What can I do for you?"
 )
 
@@ -61,7 +68,7 @@ async def _gate(update: Update) -> bool:
     if text and text.lower() == config.GODFATHER_ANSWER.lower():   # exact secret code
         db.set_verified(uid, update.effective_user.full_name)
         db.reset_failed_code(uid)
-        await update.message.reply_text(WELCOME, parse_mode="Markdown")
+        await update.message.reply_text(WELCOME, disable_web_page_preview=True)
     elif text:
         used, banned = db.record_failed_code(
             uid, update.effective_user.full_name, config.MAX_CODE_ATTEMPTS, config.BAN_HOURS)
@@ -172,6 +179,12 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"Your Telegram ID: {update.effective_user.id}")
+
+
+async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _gate(update):
+        return
+    await update.message.reply_text(WELCOME, disable_web_page_preview=True)
 
 
 def _setup_guide(redirect: str) -> str:
@@ -563,6 +576,7 @@ async def checknow(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def _post_init(app: Application) -> None:
     await app.bot.set_my_commands([
         BotCommand("start", "What I can do"),
+        BotCommand("help", "Show all commands and examples"),
         BotCommand("connect", "Connect a Sheet or your Google account"),
         BotCommand("sheets", "See or switch your connected Sheets"),
         BotCommand("accounts", "Switch or add Google accounts"),
@@ -581,6 +595,7 @@ def build_application() -> Application:
         .build()
     )
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("connect", connect))
     app.add_handler(CommandHandler("accounts", accounts))
