@@ -49,7 +49,8 @@ def main() -> None:
 
     app = build_application()
     log.info("Brain is running. Press Ctrl+C to stop.")
-    app.run_polling(allowed_updates=["message"])
+    # Must include callback_query, or inline button taps never reach the bot.
+    app.run_polling(allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":
