@@ -15,7 +15,7 @@ import crypto
 import db
 from bot.auth import is_allowed
 from brain import agent, tools, vision
-from integrations import drive, gservice, oauth, sheets
+from integrations import drive, gservice, mailbox, oauth, sheets
 from scheduler.jobs import run_daily_check, start_scheduler
 
 WELCOME = (
@@ -376,6 +376,57 @@ async def sheets_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines), reply_markup=_sheets_keyboard(uid))
 
 
+class _MailCreds:
+    def __init__(self, email, password, ih, ip, sh, sp):
+        self.email, self.password = email, password
+        self.imap_host, self.imap_port, self.smtp_host, self.smtp_port = ih, ip, sh, sp
+
+
+async def addmail(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Connect a non-Google mailbox (IMAP/SMTP). Password handled here, never sent to the AI."""
+    if not await _gate(update):
+        return
+    uid = update.effective_user.id
+    chat_id = update.effective_chat.id
+    db.get_or_create_user(uid, update.effective_user.full_name)
+    args = ctx.args or []
+    # Delete the message immediately — it contains a password.
+    try:
+        await ctx.bot.delete_message(chat_id, update.message.message_id)
+    except Exception:  # noqa: BLE001
+        pass
+    if len(args) < 2:
+        return await ctx.bot.send_message(
+            chat_id,
+            "To connect an email mailbox, send:\n"
+            "/addmail your@email password [provider]\n\n"
+            "Examples:\n"
+            "• /addmail me@mydomain.com mypass migadu\n"
+            "• /addmail me@zoho.com mypass zoho\n"
+            "• custom host: /addmail me@x.com mypass imap.host.com smtp.host.com\n\n"
+            "Your password is encrypted and this message is deleted automatically.")
+    email_addr, password = args[0], args[1]
+    provider = args[2] if len(args) > 2 else None
+    smtp = args[3] if len(args) > 3 else None
+    ih, ip, sh, sp = mailbox.resolve_hosts(email_addr, provider, smtp)
+    await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
+    creds = _MailCreds(email_addr, password, ih, ip, sh, sp)
+    try:
+        await asyncio.to_thread(mailbox.check_inbox, creds, 1)   # validate login
+    except Exception as e:  # noqa: BLE001
+        return await ctx.bot.send_message(
+            chat_id,
+            f"⚠️ Couldn't log in to {email_addr}: {e}\n\n"
+            f"Double-check the password, or give the host explicitly:\n"
+            f"/addmail {email_addr} <password> imap.migadu.com smtp.migadu.com")
+    count = db.add_mail_account(uid, email_addr, crypto.encrypt(password), ih, ip, sh, sp)
+    await ctx.bot.send_message(
+        chat_id,
+        f"✅ Mailbox {email_addr} connected ({ih}). You now have {count}.\n"
+        f"Try: \"check my email\" or \"send a mail to …\".\n"
+        f"(I deleted your password message for safety.)")
+
+
 async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _gate(update):
         return
@@ -515,6 +566,7 @@ async def _post_init(app: Application) -> None:
         BotCommand("connect", "Connect a Sheet or your Google account"),
         BotCommand("sheets", "See or switch your connected Sheets"),
         BotCommand("accounts", "Switch or add Google accounts"),
+        BotCommand("addmail", "Connect an email mailbox (Migadu, Zoho, IMAP)"),
         BotCommand("status", "See what you have connected"),
         BotCommand("whoami", "Show my Telegram ID"),
     ])
@@ -533,6 +585,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("connect", connect))
     app.add_handler(CommandHandler("accounts", accounts))
     app.add_handler(CommandHandler("sheets", sheets_cmd))
+    app.add_handler(CommandHandler("addmail", addmail))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("checknow", checknow))
     app.add_handler(CallbackQueryHandler(on_callback))

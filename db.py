@@ -77,6 +77,24 @@ class GoogleAccount(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class MailAccount(Base):
+    """A generic IMAP/SMTP mailbox (e.g. Migadu). Password stored encrypted."""
+    __tablename__ = "mail_accounts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    telegram_id: Mapped[int] = mapped_column(
+        ForeignKey("users.telegram_id"), index=True, nullable=False
+    )
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    password_enc: Mapped[str] = mapped_column(Text, nullable=False)
+    imap_host: Mapped[str] = mapped_column(String(255))
+    imap_port: Mapped[int] = mapped_column(default=993)
+    smtp_host: Mapped[str] = mapped_column(String(255))
+    smtp_port: Mapped[int] = mapped_column(default=465)
+    is_default: Mapped[bool] = mapped_column(default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class ConnectedSheet(Base):
     """A Google Sheet the user shared with the bot. A user may connect several."""
     __tablename__ = "connected_sheets"
@@ -384,6 +402,77 @@ def get_default_account(telegram_id: int) -> str | None:
     with session() as s:
         user = s.get(User, telegram_id)
         return user.default_account if user else None
+
+
+def add_mail_account(telegram_id: int, email: str, password_enc: str,
+                     imap_host: str, imap_port: int, smtp_host: str, smtp_port: int) -> int:
+    """Add/update an IMAP mailbox. First one becomes default. Returns total count."""
+    with session() as s:
+        row = s.scalars(select(MailAccount).where(
+            MailAccount.telegram_id == telegram_id, MailAccount.email == email)).first()
+        if row:
+            row.password_enc = password_enc
+            row.imap_host, row.imap_port = imap_host, imap_port
+            row.smtp_host, row.smtp_port = smtp_host, smtp_port
+        else:
+            any_m = s.scalars(select(MailAccount).where(
+                MailAccount.telegram_id == telegram_id)).first()
+            s.add(MailAccount(telegram_id=telegram_id, email=email, password_enc=password_enc,
+                              imap_host=imap_host, imap_port=imap_port,
+                              smtp_host=smtp_host, smtp_port=smtp_port,
+                              is_default=(any_m is None)))
+        s.commit()
+        return s.scalar(select(func.count()).select_from(MailAccount).where(
+            MailAccount.telegram_id == telegram_id))
+
+
+def list_mail_accounts(telegram_id: int) -> list["MailAccount"]:
+    with session() as s:
+        rows = s.scalars(select(MailAccount).where(
+            MailAccount.telegram_id == telegram_id).order_by(MailAccount.id)).all()
+        for r in rows:
+            s.expunge(r)
+        return list(rows)
+
+
+def get_mail_account(telegram_id: int, email: str | None = None) -> "MailAccount | None":
+    with session() as s:
+        stmt = select(MailAccount).where(MailAccount.telegram_id == telegram_id)
+        if email:
+            stmt = stmt.where(MailAccount.email.ilike(f"%{email}%"))
+        else:
+            dflt = s.scalars(stmt.where(MailAccount.is_default.is_(True))).first()
+            if dflt:
+                s.expunge(dflt)
+                return dflt
+        row = s.scalars(stmt.order_by(MailAccount.id)).first()
+        if row:
+            s.expunge(row)
+        return row
+
+
+def set_default_mail(telegram_id: int, email: str) -> bool:
+    with session() as s:
+        rows = s.scalars(select(MailAccount).where(
+            MailAccount.telegram_id == telegram_id)).all()
+        found = False
+        for r in rows:
+            r.is_default = email.lower() in r.email.lower()
+            found = found or r.is_default
+        s.commit()
+        return found
+
+
+def remove_mail_account(telegram_id: int, email: str) -> bool:
+    with session() as s:
+        row = s.scalars(select(MailAccount).where(
+            MailAccount.telegram_id == telegram_id,
+            MailAccount.email.ilike(f"%{email}%"))).first()
+        if row is None:
+            return False
+        s.delete(row)
+        s.commit()
+        return True
 
 
 def remove_google_account(telegram_id: int, email: str) -> bool:

@@ -24,7 +24,7 @@ from brain import money
 from integrations import calendar as gcal
 from integrations import client as goauth
 from integrations import docs as gdocs
-from integrations import drive, gmail, gservice, pdf, sheets
+from integrations import drive, gmail, gservice, mailbox, pdf, sheets
 
 _OAUTH_HINT = ("To use email / calendar / docs / drive, connect a Google account first — "
                "send /connect (you can link several).")
@@ -424,6 +424,57 @@ def analyze_statement(telegram_id: int, gmail_query: str,
 
 
 # =========================================================================
+#  Non-Google mailbox (IMAP/SMTP — Migadu, Zoho, custom hosts)
+# =========================================================================
+def _resolve_mailbox(telegram_id: int, account: str | None):
+    accts = db.list_mail_accounts(telegram_id)
+    if not accts:
+        return None, "No email mailbox connected yet. Add one with /addmail (works for Migadu, Zoho, custom hosts)."
+    acct = db.get_mail_account(telegram_id, account)
+    if acct is None:
+        return None, ("No mailbox matches that. Connected: " + ", ".join(a.email for a in accts))
+    acct.password = crypto.decrypt(acct.password_enc)
+    return acct, None
+
+
+def check_mailbox(telegram_id: int, count: int = 5, account: str | None = None) -> str:
+    """Read recent mail from a password-connected mailbox (Migadu etc.)."""
+    acct, err = _resolve_mailbox(telegram_id, account)
+    if err:
+        return err
+    try:
+        mails = mailbox.check_inbox(acct, max(1, min(count, 15)))
+    except Exception as e:  # noqa: BLE001
+        return f"Couldn't check {acct.email}: {e}"
+    if not mails:
+        return f"No mail in {acct.email}."
+    return f"📬 Latest in {acct.email}:\n\n" + "\n\n".join(
+        f"From: {m['from']}\nSubject: {m['subject']}\n{m['date']}" for m in mails)
+
+
+def send_from_mailbox(telegram_id: int, to: str, subject: str, body: str,
+                      account: str | None = None) -> str:
+    """Send an email from a password-connected mailbox (Migadu etc.)."""
+    acct, err = _resolve_mailbox(telegram_id, account)
+    if err:
+        return err
+    try:
+        mailbox.send_mail(acct, to, subject, body)
+    except Exception as e:  # noqa: BLE001
+        return f"Couldn't send from {acct.email}: {e}"
+    return f"📧 Sent from {acct.email} to {to}."
+
+
+def list_mailboxes(telegram_id: int) -> str:
+    accts = db.list_mail_accounts(telegram_id)
+    if not accts:
+        return "No email mailboxes connected. Add one with /addmail."
+    dflt = db.get_mail_account(telegram_id)
+    return "📬 Connected mailboxes:\n" + "\n".join(
+        f"• {a.email}" + ("  ⭐ default" if dflt and a.email == dflt.email else "") for a in accts)
+
+
+# =========================================================================
 #  Registry + schemas
 # =========================================================================
 TOOLS: dict[str, callable] = {
@@ -453,6 +504,9 @@ TOOLS: dict[str, callable] = {
     "create_document": create_document,
     "list_drive_files": list_drive_files,
     "analyze_statement": analyze_statement,
+    "check_mailbox": check_mailbox,
+    "send_from_mailbox": send_from_mailbox,
+    "list_mailboxes": list_mailboxes,
 }
 
 
@@ -544,4 +598,13 @@ SCHEMAS: list[dict] = [
          "pdf_password": {"type": "string", "description": "Password if the PDF is protected. Optional."},
          "account": {"type": "string", "description": "Which linked account. Optional."}},
         ["gmail_query"]),
+
+    _fn("check_mailbox", "Read recent email from a NON-Google mailbox the user connected with a password (Migadu, Zoho, custom IMAP). Use this (not read_emails) for those. To add one, tell them to use /addmail.",
+        {"count": {"type": "integer", "description": "How many recent messages. Default 5."},
+         "account": {"type": "string", "description": "Which mailbox (email or part of it) if they have several. Optional."}}),
+    _fn("send_from_mailbox", "Send an email from a NON-Google mailbox connected with a password (Migadu etc.).",
+        {"to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"},
+         "account": {"type": "string", "description": "Which mailbox to send from. Optional."}},
+        ["to", "subject", "body"]),
+    _fn("list_mailboxes", "List the non-Google mailboxes (IMAP) the user has connected.", {}),
 ]
