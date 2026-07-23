@@ -1,6 +1,7 @@
 # Secrets — never commit
 .env
 service_account.json
+coolify-secrets.txt
 *.json.key
 client_secret*.json
 
