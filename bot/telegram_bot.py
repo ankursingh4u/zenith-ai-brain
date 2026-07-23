@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes,
     MessageHandler, filters
@@ -451,6 +451,13 @@ async def checknow(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _post_init(app: Application) -> None:
+    await app.bot.set_my_commands([
+        BotCommand("start", "What I can do"),
+        BotCommand("connect", "Connect a Sheet or your Google account"),
+        BotCommand("accounts", "Switch or add Google accounts"),
+        BotCommand("status", "See what you have connected"),
+        BotCommand("whoami", "Show my Telegram ID"),
+    ])
     start_scheduler(app)
 
 
