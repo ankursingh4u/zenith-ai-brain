@@ -7,10 +7,25 @@ another user, because it never supplies the user id.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from openai import OpenAI
+
+
+def _strip_markdown(t: str) -> str:
+    """Remove Markdown that Telegram shows as literal junk (**, __, #, tables, ``)."""
+    if not t:
+        return t
+    t = re.sub(r"\*\*(.*?)\*\*", r"\1", t, flags=re.S)   # **bold** -> bold
+    t = t.replace("**", "")
+    t = re.sub(r"__(.*?)__", r"\1", t, flags=re.S)        # __bold__ -> bold
+    t = re.sub(r"`{1,3}([^`]*)`{1,3}", r"\1", t)          # `code` -> code
+    t = re.sub(r"^\s{0,3}#{1,6}\s+", "", t, flags=re.M)   # # headings
+    # collapse markdown table separator rows like |---|---|
+    t = re.sub(r"^\s*\|?[\s:|-]*-[-\s:|]*\|?\s*$", "", t, flags=re.M)
+    return t.strip()
 
 import config
 from brain import tools
@@ -86,7 +101,7 @@ def handle_message(telegram_id: int, text: str, history: list[dict]) -> str:
         msg = resp.choices[0].message
 
         if not msg.tool_calls:
-            return msg.content or "(no response)"
+            return _strip_markdown(msg.content or "(no response)")
 
         # Record the assistant's tool-call request, then run each tool.
         messages.append(msg.model_dump(exclude_none=True))
