@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 from datetime import datetime
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -14,7 +15,7 @@ import config
 import crypto
 import db
 from bot.auth import is_allowed
-from brain import agent, tools, vision
+from brain import agent, speech, tools, vision
 from integrations import drive, gservice, mailbox, oauth, sheets
 from scheduler.jobs import run_daily_check, start_scheduler
 
@@ -26,6 +27,7 @@ WELCOME = (
     "🔐 Passwords — \"save my wifi password\", \"what's my gmail password\"\n"
     "🧾 Bills — send a photo, I read the amount and log it\n"
     "📧 Email — \"check my email\", \"send a mail to …\"\n"
+    "🎤 Voice — send a voice note and I'll reply out loud, like a PA\n"
     "✏️ Fixes — \"undo that\", \"edit last to 2500\"\n\n"
     "⚙️ Commands (or tap the ☰ menu next to the message box):\n"
     "/connect — link a Google Sheet or Google account\n"
@@ -489,6 +491,50 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(reply)
 
 
+async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """A voice note: transcribe → act → reply in voice (like a PA)."""
+    if not await _gate(update):
+        return
+    uid = update.effective_user.id
+    db.get_or_create_user(uid, update.effective_user.full_name)
+    msg = update.message
+    chat_id = update.effective_chat.id
+
+    await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
+    media = msg.voice or msg.audio
+    tg_file = await media.get_file()
+    audio = bytes(await tg_file.download_as_bytearray())
+
+    try:
+        transcript = await asyncio.to_thread(speech.transcribe, audio, "voice.oga")
+    except Exception as e:  # noqa: BLE001
+        return await msg.reply_text(f"Sorry, I couldn't understand the audio: {e}")
+    if not transcript:
+        return await msg.reply_text("I couldn't hear anything — could you try again?")
+
+    # A voice 'yes/no' can also resolve a pending confirmation.
+    if await _handle_pending(update, ctx, uid, transcript):
+        return
+
+    hist = db.recent_turns(uid, limit=12)
+    try:
+        reply = await asyncio.to_thread(agent.handle_message, uid, transcript, hist)
+    except Exception as e:  # noqa: BLE001
+        reply = f"⚠️ Something went wrong: {e}"
+    db.save_turn(uid, "user", transcript)
+    db.save_turn(uid, "assistant", reply)
+
+    text_out = f"🎤 You: {transcript}\n\n{reply}"
+    if config.VOICE_REPLIES:
+        try:
+            await ctx.bot.send_chat_action(chat_id=chat_id, action="record_voice")
+            spoken = await asyncio.to_thread(speech.speak, reply)
+            return await msg.reply_voice(voice=io.BytesIO(spoken), caption=text_out[:1024])
+        except Exception:  # noqa: BLE001 — fall back to text if TTS/voice send fails
+            pass
+    await msg.reply_text(text_out)
+
+
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """A photo/document = a bill. Read it with vision, log it, save to sheet/Drive."""
     if not await _gate(update):
@@ -604,6 +650,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("checknow", checknow))
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     return app
