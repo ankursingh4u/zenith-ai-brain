@@ -18,10 +18,15 @@ _TTS_MAX_CHARS = 1200
 
 
 def transcribe(audio_bytes: bytes, filename: str = "voice.oga") -> str:
-    """Turn a voice recording into text."""
+    """Turn a voice recording into text (biased to English/Hindi, not Urdu)."""
     f = io.BytesIO(audio_bytes)
     f.name = filename                     # the SDK infers the format from the name
-    resp = _client.audio.transcriptions.create(model=config.STT_MODEL, file=f)
+    resp = _client.audio.transcriptions.create(
+        model=config.STT_MODEL, file=f,
+        language=config.STT_LANGUAGE or None,
+        # Context hint nudges Whisper toward Hindi/English spelling over Urdu.
+        prompt="This is a casual voice note in English and Hindi (Hinglish).",
+    )
     return (resp.text or "").strip()
 
 

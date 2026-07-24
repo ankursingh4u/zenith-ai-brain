@@ -26,6 +26,8 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
 # --- Voice (speech-to-text + text-to-speech) ---
 STT_MODEL = os.getenv("STT_MODEL", "whisper-1").strip()        # transcription
+# Force a transcription language (e.g. "hi" or "en"); empty = auto-detect.
+STT_LANGUAGE = os.getenv("STT_LANGUAGE", "").strip()
 TTS_MODEL = os.getenv("TTS_MODEL", "tts-1").strip()            # spoken replies
 TTS_VOICE = os.getenv("TTS_VOICE", "nova").strip()             # nova/shimmer/alloy/...
 # Reply with a spoken voice note when the user sends a voice note.
