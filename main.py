@@ -48,7 +48,7 @@ def main() -> None:
     log.info("Gmail/Calendar/Docs: each user connects their own Google via /connect (fully per-user).")
 
     app = build_application()
-    log.info("Brain is running. Press Ctrl+C to stop.")
+    log.info("Brain is running (build %s). Press Ctrl+C to stop.", config.BUILD)
     # Must include callback_query, or inline button taps never reach the bot.
     app.run_polling(allowed_updates=["message", "callback_query"])
 

@@ -96,3 +96,8 @@ TIMEZONE = os.getenv("TIMEZONE", "Asia/Kolkata").strip()
 DAILY_JOB_HOUR = int(os.getenv("DAILY_JOB_HOUR", "9"))
 # How many days before a bill's due date to send a reminder.
 DUE_REMINDER_DAYS = int(os.getenv("DUE_REMINDER_DAYS", "3"))
+
+# --- Build marker ---
+# Bumped whenever the bot's behaviour changes, so /version tells you instantly
+# whether the deployment actually picked up the latest code.
+BUILD = os.getenv("BUILD", "2026-07-27.4 sheet-tabs+column-aware-photo").strip()

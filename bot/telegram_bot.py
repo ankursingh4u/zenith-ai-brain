@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
 from datetime import datetime
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -18,6 +19,8 @@ from bot.auth import is_allowed
 from brain import agent, speech, tools, vision
 from integrations import drive, gservice, mailbox, oauth, sheets
 from scheduler.jobs import run_daily_check, start_scheduler
+
+log = logging.getLogger("brain.bot")
 
 WELCOME = (
     "🧠 Zenith Brain — your personal assistant & accountant.\n"
@@ -579,6 +582,7 @@ async def _photo_with_instruction(
     """Photo + caption = one instruction, done in one shot: upload the image, read
     the screenshot against the target tab's columns and existing rows, write the row."""
     msg = update.message
+    log.info("photo+caption from %s (build %s): %r", uid, config.BUILD, caption[:120])
 
     if db.count_sheets(uid) == 0:
         return await msg.reply_text(
@@ -596,11 +600,13 @@ async def _photo_with_instruction(
     tab = tab or (tabs[0] if tabs else None)
     if not tab:
         return await msg.reply_text("Your sheet has no tabs I can write to.")
+    log.info("photo: writing to tab %r of %s (tabs seen: %s)", tab, uid, tabs)
 
     try:
         fields, headers = await asyncio.to_thread(
             _build_row, uid, caption, parsed, tab, link, content, mime)
     except Exception as e:  # noqa: BLE001
+        log.exception("photo: building the row failed")
         return await msg.reply_text(f"⚠️ Couldn't read your sheet layout: {e}")
 
     amount = _amount_of(parsed)
@@ -721,6 +727,26 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await msg.reply_text("🧾 Bill received." + logged_line + drive_line)
 
 
+async def version(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Which build is actually running — the fastest way to spot a stale deploy."""
+    if not await _gate(update):
+        return
+    uid = update.effective_user.id
+    lines = [f"🏷 Build: {config.BUILD}"]
+    try:
+        tabs = await asyncio.to_thread(sheets.list_tabs, uid)
+        lines.append("📑 Tabs I can see: " + (", ".join(tabs) if tabs else "none"))
+        if tabs:
+            heads = await asyncio.to_thread(sheets.tab_headers, uid, tabs[0])
+            lines.append(f"🔠 Columns of '{tabs[0]}': "
+                         + (", ".join(heads) if heads else "(no header row)"))
+    except sheets.NoSheet:
+        lines.append("📑 No sheet connected.")
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"⚠️ Can't read your sheet: {e}")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def checknow(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Manually trigger the due-date sweep (for testing)."""
     if not await _gate(update):
@@ -739,6 +765,7 @@ async def _post_init(app: Application) -> None:
         BotCommand("accounts", "Switch or add Google accounts"),
         BotCommand("addmail", "Connect an email mailbox (Migadu, Zoho, IMAP)"),
         BotCommand("status", "See what you have connected"),
+        BotCommand("version", "Which build is running + my view of your sheet"),
         BotCommand("whoami", "Show my Telegram ID"),
     ])
     start_scheduler(app)
@@ -759,6 +786,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("sheets", sheets_cmd))
     app.add_handler(CommandHandler("addmail", addmail))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("version", version))
     app.add_handler(CommandHandler("checknow", checknow))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
