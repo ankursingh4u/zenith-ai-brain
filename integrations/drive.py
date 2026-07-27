@@ -182,7 +182,12 @@ def save_anywhere(telegram_id: int, filename: str, content: bytes,
                 "the folder holding your sheet")
     except Exception as e:  # noqa: BLE001
         errors.append(f"sheet folder: {e}")
-    for acct in db.list_google_accounts(telegram_id):
+    # The user's chosen default account first, then the rest as a fallback.
+    accts = db.list_google_accounts(telegram_id)
+    default = db.get_default_account(telegram_id)
+    if default:
+        accts = sorted(accts, key=lambda a: a.email != default)
+    for acct in accts:
         try:
             link = upload_to_account(telegram_id, acct.email, filename, content, mime_type)
             return link, f"{acct.email} → {_UPLOAD_FOLDER}"
