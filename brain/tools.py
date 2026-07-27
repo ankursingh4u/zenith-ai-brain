@@ -69,6 +69,18 @@ def set_current_message(text: str) -> None:
     _current_message.set(text or "")
 
 
+# The last image each user sent, so a follow-up ("put it on my drive") still works.
+# Small and short-lived: {telegram_id: (content, mime, filename)}.
+_last_image: dict[int, tuple[bytes, str, str]] = {}
+
+
+def remember_image(telegram_id: int, content: bytes, mime: str, filename: str) -> None:
+    _last_image[telegram_id] = (content, mime, filename)
+    if len(_last_image) > 50:                      # keep the cache bounded
+        for k in list(_last_image)[:-50]:
+            _last_image.pop(k, None)
+
+
 def _has_sheet(telegram_id: int) -> bool:
     return db.count_sheets(telegram_id) > 0
 
@@ -102,8 +114,8 @@ def log_transaction(
     extra = ""
     if _has_sheet(telegram_id):
         try:
-            sheets.append_transaction(telegram_id, amount, kind, category, note)
-            extra = " → saved to your sheet"
+            used = sheets.append_transaction(telegram_id, amount, kind, category, note)
+            extra = f" → saved to your sheet ({used})"
         except Exception:  # noqa: BLE001
             extra = " (⚠️ couldn't write to your sheet — is it still shared with me?)"
 
@@ -284,17 +296,94 @@ def list_sheets(telegram_id: int) -> str:
     return "\n".join(lines)
 
 
-def read_sheet(telegram_id: int, limit: int = 100) -> str:
+def read_sheet(telegram_id: int, limit: int = 100, tab: str | None = None) -> str:
     """Read the user's connected sheet so the AI can reason over their data."""
     if not _has_sheet(telegram_id):
         return ("You haven't connected a sheet yet. " + sheet_setup_help(telegram_id))
     try:
-        rows = sheets.read_rows(telegram_id, limit)
+        rows = sheets.read_rows(telegram_id, limit, tab)
     except Exception as e:  # noqa: BLE001
         return f"Couldn't read your sheet: {e}"
     if not rows:
-        return "Your sheet is empty."
+        return "That tab is empty."
     return "Your sheet data (tab-separated):\n" + "\n".join("\t".join(map(str, r)) for r in rows)
+
+
+def sheet_structure(telegram_id: int) -> str:
+    """List every TAB in the default sheet with its column headers."""
+    if not _has_sheet(telegram_id):
+        return ("You haven't connected a sheet yet. " + sheet_setup_help(telegram_id))
+    try:
+        return ("Tabs and columns in your default sheet:\n"
+                + sheets.describe_structure(telegram_id)
+                + "\nUse add_sheet_row with the exact column names above.")
+    except Exception as e:  # noqa: BLE001
+        return f"Couldn't read your sheet structure: {e}"
+
+
+def _as_dict(fields) -> dict:
+    """Accept a real object or a JSON string (models sometimes send a string)."""
+    if isinstance(fields, dict):
+        return fields
+    if isinstance(fields, str):
+        import json
+        try:
+            parsed = json.loads(fields)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
+    return {}
+
+
+def add_sheet_row(telegram_id: int, fields, tab: str | None = None) -> str:
+    """Write one row into a specific tab, matching the tab's own column headers."""
+    if not _has_sheet(telegram_id):
+        return ("You haven't connected a sheet yet. " + sheet_setup_help(telegram_id))
+    data = _as_dict(fields)
+    if not data:
+        return "No column values given — pass fields like {\"DATE\": \"...\", \"AMOUNT\": \"5000\"}."
+    if tab:
+        real = sheets.resolve_tab(telegram_id, tab)
+        if real is None:
+            try:
+                available = ", ".join(sheets.list_tabs(telegram_id))
+            except Exception as e:  # noqa: BLE001
+                return f"Couldn't open your sheet: {e}"
+            return (f"There's no tab matching '{tab}'. Tabs in this sheet: {available}. "
+                    f"Pick one of these and call add_sheet_row again.")
+    try:
+        used, unmatched = sheets.append_mapped(telegram_id, data, tab)
+    except Exception as e:  # noqa: BLE001
+        return f"Couldn't write to your sheet: {e}"
+    msg = f"✅ Row added to the '{used}' tab: " + ", ".join(
+        f"{k}={v}" for k, v in data.items() if v not in (None, ""))
+    if unmatched:
+        msg += (f"\n(No column found for: {', '.join(unmatched)} — "
+                f"those values were not written.)")
+    return msg
+
+
+def switch_sheet(telegram_id: int, name: str) -> str:
+    """Make one of the connected sheets the default (where entries go)."""
+    sheet_id = db.resolve_sheet(telegram_id, name)
+    if not sheet_id:
+        rows = db.list_sheets(telegram_id)
+        names = ", ".join(r.title or "Sheet" for r in rows) or "none"
+        return f"No connected sheet matches '{name}'. Connected: {names}."
+    db.set_default_sheet(telegram_id, sheet_id)
+    return f"✅ Entries will now go to '{name}'."
+
+
+def upload_image_to_drive(telegram_id: int, filename: str | None = None) -> str:
+    """Upload the image the user most recently sent to Drive and return a public link."""
+    blob = _last_image.get(telegram_id)
+    if not blob:
+        return "I don't have a recent image from you — send the photo again."
+    content, mime, default_name = blob
+    link, where = drive.save_anywhere(telegram_id, filename or default_name, content, mime)
+    if not link:
+        return f"Couldn't upload to Drive ({where})."
+    return f"📁 Uploaded to {where} (anyone with the link can view): {link}"
 
 
 # =========================================================================
@@ -496,6 +585,10 @@ TOOLS: dict[str, callable] = {
     "register_drive_folder": register_drive_folder,
     "list_sheets": list_sheets,
     "read_sheet": read_sheet,
+    "sheet_structure": sheet_structure,
+    "add_sheet_row": add_sheet_row,
+    "switch_sheet": switch_sheet,
+    "upload_image_to_drive": upload_image_to_drive,
     "list_accounts": list_accounts,
     "read_emails": read_emails,
     "send_email": send_email,
@@ -563,8 +656,20 @@ SCHEMAS: list[dict] = [
     _fn("register_drive_folder", "Connect a Google Drive folder for saving bill photos. Use when they send a Drive folder link.",
         {"folder_url": {"type": "string", "description": "The Google Drive folder URL or id."}}, ["folder_url"]),
     _fn("list_sheets", "List how many Google Sheets the user has connected and which is the default.", {}),
-    _fn("read_sheet", "Read the user's default connected sheet so you can answer questions about their data (spending, totals, history).",
-        {"limit": {"type": "integer", "description": "How many recent rows. Default 100."}}),
+    _fn("read_sheet", "Read a tab of the user's default connected sheet so you can answer questions about their data (spending, totals, history).",
+        {"limit": {"type": "integer", "description": "How many recent rows. Default 100."},
+         "tab": {"type": "string", "description": "Which tab to read, e.g. 'EXPENSES'. Omit for the first tab."}}),
+    _fn("sheet_structure", "List every TAB in the user's sheet and that tab's column headers. Call this FIRST whenever you need to write a row and don't already know the tabs/columns.", {}),
+    _fn("add_sheet_row", "Write ONE row into a specific tab of the user's sheet, filling that tab's own columns. Use this (not log_transaction) when the user names a tab or the sheet has custom columns like TRANSFER TO / TRANSFER FROM / REASON / IMAGES.",
+        {"fields": {"type": "object",
+                    "description": "Column name -> value, using the tab's real headers, e.g. {\"DATE\":\"27/07/2026\",\"TRANSFER TO\":\"PAMPOSH\",\"AMOUNT\":\"5000\",\"TRANSFER FROM\":\"PINKY YES ACC.\",\"REASON\":\"WASHROOM CLEANER\",\"PAYMENT MODE\":\"PAYTM UPI\",\"IMAGES\":\"https://drive.google.com/...\"}",
+                    "additionalProperties": {"type": "string"}},
+         "tab": {"type": "string", "description": "Tab name, e.g. 'EXPENSES'. Loose names like 'expense' are matched automatically."}},
+        ["fields"]),
+    _fn("switch_sheet", "Make one of the user's connected sheets the default one that entries go into.",
+        {"name": {"type": "string", "description": "Part of the sheet's title, e.g. 'expenses'."}}, ["name"]),
+    _fn("upload_image_to_drive", "Upload the image the user most recently sent to their Drive and get back a public 'anyone with the link' URL (for putting in a sheet's IMAGES column).",
+        {"filename": {"type": "string", "description": "Optional file name."}}),
 
     _fn("list_accounts", "List the user's linked Google accounts (emails).", {}),
 

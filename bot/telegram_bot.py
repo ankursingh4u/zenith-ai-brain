@@ -535,6 +535,48 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await msg.reply_text(text_out)
 
 
+def _bill_facts(parsed: dict) -> str:
+    """The vision-extracted fields, as plain lines the brain can act on."""
+    keys = ("merchant", "amount", "kind", "category", "date", "note")
+    lines = [f"- {k}: {parsed[k]}" for k in keys if parsed.get(k) not in (None, "")]
+    return "\n".join(lines) or "- (nothing readable)"
+
+
+async def _photo_with_instruction(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, caption: str,
+    parsed: dict, filename: str, content: bytes, mime: str,
+) -> None:
+    """Photo + caption = one instruction. Upload the image, then let the brain
+    carry out the caption (which tab, which columns) in a single turn."""
+    msg = update.message
+
+    link, where = await asyncio.to_thread(drive.save_anywhere, uid, filename, content, mime)
+    image_line = (f"The image is already uploaded to Drive ({where}) and is publicly "
+                  f"viewable at: {link}\nUse this exact URL for any image/screenshot column."
+                  if link else
+                  f"The image could NOT be uploaded to Drive ({where}). Say so briefly, "
+                  f"but still make the sheet entry.")
+
+    prompt = (
+        f"{caption}\n\n"
+        f"[The user sent a payment screenshot with that message.]\n"
+        f"Details read from the screenshot:\n{_bill_facts(parsed)}\n"
+        f"{image_line}\n"
+        f"Now carry out the instruction: look up the sheet's tabs/columns if needed "
+        f"and write the entry into the tab they named. Use the amount from the "
+        f"screenshot exactly. Do not ask for confirmation, do it."
+    )
+
+    hist = db.recent_turns(uid, limit=12)
+    try:
+        reply = await asyncio.to_thread(agent.handle_message, uid, prompt, hist)
+    except Exception as e:  # noqa: BLE001
+        reply = f"⚠️ Something went wrong: {e}"
+    db.save_turn(uid, "user", f"[photo] {caption}")
+    db.save_turn(uid, "assistant", reply)
+    await msg.reply_text(reply)
+
+
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """A photo/document = a bill. Read it with vision, log it, save to sheet/Drive."""
     if not await _gate(update):
@@ -553,10 +595,14 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         mime = msg.document.mime_type or "application/octet-stream"
 
     content = bytes(await tg_file.download_as_bytearray())
-    caption = (msg.caption or "bill").strip().replace(" ", "_")[:40]
-    filename = f"{datetime.now():%Y%m%d_%H%M%S}_{caption}.{ext}"
+    caption = (msg.caption or "").strip()
+    slug = (caption or "bill").replace(" ", "_")[:40]
+    filename = f"{datetime.now():%Y%m%d_%H%M%S}_{slug}.{ext}"
 
     await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    # Keep the image around so a follow-up ("upload it to my drive") still works.
+    tools.remember_image(uid, content, mime, filename)
 
     # 1) Read the bill with vision (works even before Google is connected).
     parsed = {}
@@ -566,7 +612,18 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:  # noqa: BLE001
             parsed = {}
 
-    # 2) Auto-log the transaction if an amount was read.
+    # 1b) A caption is an instruction ("log this in the Expense tab, upload the
+    #     screenshot to Drive"). Hand it to the brain with the extracted facts and
+    #     the Drive link so it can do the whole thing in one turn.
+    if caption:
+        return await _photo_with_instruction(update, ctx, uid, caption, parsed,
+                                             filename, content, mime)
+
+    # 2) Save the image to Drive first, so its public link can go in the sheet row.
+    link, where = await asyncio.to_thread(drive.save_anywhere, uid, filename, content, mime)
+    drive_line = f"\n📁 Saved to {where}: {link}" if link else ""
+
+    # 3) Auto-log the transaction if an amount was read.
     logged_line = ""
     try:
         amount = float(parsed.get("amount") or 0)
@@ -588,24 +645,16 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         sheet_id, _ = db.get_user_resources(uid)
         if sheet_id:
             try:
-                await asyncio.to_thread(
+                used = await asyncio.to_thread(
                     sheets.append_transaction, uid, amount,
                     "in" if parsed.get("kind") == "in" else "out",
                     parsed.get("category"), parsed.get("merchant") or "bill",
+                    None, {"transfer to": parsed.get("merchant") or "",
+                           "images": link or ""},
                 )
-                logged_line += " → saved to your sheet"
+                logged_line += f" → saved to your sheet ({used})"
             except Exception:  # noqa: BLE001
                 logged_line += " (⚠️ couldn't write to your sheet)"
-
-    # 3) Save the image into the user's connected Drive folder (if any).
-    drive_line = ""
-    _, folder_id = db.get_user_resources(uid)
-    if folder_id:
-        try:
-            link = await asyncio.to_thread(drive.upload_file, uid, filename, content, mime)
-            drive_line = f"\n📁 Saved to your Drive: {link}"
-        except Exception as e:  # noqa: BLE001
-            drive_line = f"\n⚠️ Couldn't save to Drive: {e}"
 
     await msg.reply_text("🧾 Bill received." + logged_line + drive_line)
 
