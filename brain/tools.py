@@ -74,6 +74,23 @@ def set_current_message(text: str) -> None:
 _last_image: dict[int, tuple[bytes, str, str]] = {}
 
 
+# Which tools actually ran this turn, per user. A plain dict (not a ContextVar)
+# because a turn runs in a worker thread and would not propagate back.
+_calls: dict[int, list[str]] = {}
+
+
+def reset_calls(telegram_id: int) -> None:
+    _calls[telegram_id] = []
+
+
+def record_call(telegram_id: int, name: str) -> None:
+    _calls.setdefault(telegram_id, []).append(name)
+
+
+def called(telegram_id: int) -> list[str]:
+    return list(_calls.get(telegram_id, []))
+
+
 def remember_image(telegram_id: int, content: bytes, mime: str, filename: str) -> None:
     _last_image[telegram_id] = (content, mime, filename)
     if len(_last_image) > 50:                      # keep the cache bounded

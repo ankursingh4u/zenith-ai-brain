@@ -145,6 +145,23 @@ def resolve_tab(telegram_id: int, hint: str | None, sheet_id: str | None = None)
     return None
 
 
+def tab_from_text(telegram_id: int, text: str, sheet_id: str | None = None) -> str | None:
+    """Spot a tab name inside a free-text instruction, e.g. '... (Expense) tab'."""
+    if not text:
+        return None
+    tabs = list_tabs(telegram_id, sheet_id)
+    body = _norm(text)
+    # Longest tab names first, so 'BANK TRANSFER' wins over a 'BANK' tab.
+    for t in sorted(tabs, key=lambda x: -len(_norm(x))):
+        n = _norm(t)
+        if len(n) < 3:
+            continue
+        stem = n[:-1] if n.endswith("s") else n          # EXPENSES -> EXPENSE
+        if n in body or (len(stem) >= 4 and stem in body):
+            return t
+    return None
+
+
 def tab_headers(telegram_id: int, tab: str | None = None,
                 sheet_id: str | None = None) -> list[str]:
     """The header row (row 1) of a tab. Empty list if the tab has no headers."""

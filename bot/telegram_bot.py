@@ -542,29 +542,71 @@ def _bill_facts(parsed: dict) -> str:
     return "\n".join(lines) or "- (nothing readable)"
 
 
+def _fallback_row(uid: int, caption: str, parsed: dict, tab: str | None,
+                  link: str | None) -> str:
+    """Write the entry ourselves when the AI talked instead of calling a tool.
+
+    Built only from what we actually know — the screenshot fields, the tab the
+    user named and the uploaded image link. Never invents an amount.
+    """
+    try:
+        amount = float(parsed.get("amount") or 0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    if amount <= 0:
+        return ""
+    fields = {
+        "date": datetime.now().strftime("%d/%m/%Y"),
+        "amount": f"{amount:.0f}" if amount == int(amount) else f"{amount:.2f}",
+        "transfer to": parsed.get("merchant") or "",
+        "reason": parsed.get("note") or parsed.get("category") or caption[:80],
+        "images": link or "",
+    }
+    try:
+        used, _ = sheets.append_mapped(uid, fields, tab)
+    except Exception as e:  # noqa: BLE001
+        return f"\n⚠️ Couldn't write the row: {e}"
+    return f"\n✅ Row written to '{used}': {fields['transfer to']} — {fields['amount']}"
+
+
 async def _photo_with_instruction(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, caption: str,
     parsed: dict, filename: str, content: bytes, mime: str,
 ) -> None:
-    """Photo + caption = one instruction. Upload the image, then let the brain
-    carry out the caption (which tab, which columns) in a single turn."""
+    """Photo + caption = one instruction. Upload the image, hand the brain the
+    sheet's real layout, and make sure a row lands even if it doesn't act."""
     msg = update.message
 
     link, where = await asyncio.to_thread(drive.save_anywhere, uid, filename, content, mime)
-    image_line = (f"The image is already uploaded to Drive ({where}) and is publicly "
-                  f"viewable at: {link}\nUse this exact URL for any image/screenshot column."
+    image_line = (f"The image is ALREADY uploaded to Drive ({where}) and anyone with the "
+                  f"link can view it: {link}\nPut this exact URL in the image/screenshot "
+                  f"column — do not call upload_image_to_drive again."
                   if link else
-                  f"The image could NOT be uploaded to Drive ({where}). Say so briefly, "
-                  f"but still make the sheet entry.")
+                  f"The image could NOT be uploaded to Drive ({where}). Mention that in one "
+                  f"short line, but still write the sheet row.")
+
+    # Give the model the real tabs/columns up front so it can't stall on "which tab?".
+    layout, tab_hint = "", None
+    if db.count_sheets(uid) > 0:
+        try:
+            layout = await asyncio.to_thread(sheets.describe_structure, uid)
+            tab_hint = await asyncio.to_thread(sheets.tab_from_text, uid, caption)
+        except Exception:  # noqa: BLE001
+            layout = ""
+    layout_line = (f"Their connected sheet has these tabs and columns:\n{layout}\n"
+                   if layout else "")
+    tab_line = (f"The tab to write into is '{tab_hint}'.\n" if tab_hint else "")
 
     prompt = (
         f"{caption}\n\n"
         f"[The user sent a payment screenshot with that message.]\n"
         f"Details read from the screenshot:\n{_bill_facts(parsed)}\n"
-        f"{image_line}\n"
-        f"Now carry out the instruction: look up the sheet's tabs/columns if needed "
-        f"and write the entry into the tab they named. Use the amount from the "
-        f"screenshot exactly. Do not ask for confirmation, do it."
+        f"{image_line}\n\n"
+        f"{layout_line}{tab_line}"
+        f"Call add_sheet_row NOW with that tab and the columns above filled in from the "
+        f"screenshot and the user's words. Use the amount from the screenshot exactly. "
+        f"Do not ask for confirmation and do not describe what you would do — do it, "
+        f"then report the row you wrote in one short line."
     )
 
     hist = db.recent_turns(uid, limit=12)
@@ -572,6 +614,15 @@ async def _photo_with_instruction(
         reply = await asyncio.to_thread(agent.handle_message, uid, prompt, hist)
     except Exception as e:  # noqa: BLE001
         reply = f"⚠️ Something went wrong: {e}"
+
+    # Safety net: if it never wrote the row, write it ourselves. When the user
+    # named a tab, only add_sheet_row counts — log_transaction targets the
+    # default tab and would land in the wrong place.
+    calls = set(tools.called(uid))
+    wrote = "add_sheet_row" in calls or (not tab_hint and "log_transaction" in calls)
+    if not wrote and db.count_sheets(uid) > 0:
+        reply += await asyncio.to_thread(_fallback_row, uid, caption, parsed, tab_hint, link)
+
     db.save_turn(uid, "user", f"[photo] {caption}")
     db.save_turn(uid, "assistant", reply)
     await msg.reply_text(reply)

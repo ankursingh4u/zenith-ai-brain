@@ -134,10 +134,42 @@ def upload_to_account(telegram_id: int, email: str, filename: str, content: byte
     return created.get("webViewLink") or f"https://drive.google.com/file/d/{file_id}/view"
 
 
+def upload_beside_sheet(telegram_id: int, filename: str, content: bytes,
+                        mime_type: str, public: bool = True) -> str:
+    """Upload into the folder that already contains the user's connected sheet.
+
+    Needs no extra setup: if the user shared the sheet's folder (or their whole
+    Drive) with us, its parent is writable and the file lands right next to the
+    sheet it belongs to.
+    """
+    sheet_id = db.default_sheet_id(telegram_id)
+    if not sheet_id:
+        raise NoFolder("No sheet connected.")
+    svc = gservice.drive(telegram_id)
+    parents = svc.files().get(
+        fileId=sheet_id, fields="parents", supportsAllDrives=True
+    ).execute().get("parents") or []
+    if not parents:
+        raise NoFolder("Can't see the sheet's folder.")
+    media = MediaIoBaseUpload(io.BytesIO(content), mimetype=mime_type, resumable=False)
+    created = svc.files().create(
+        body={"name": filename, "parents": [parents[0]]},
+        media_body=media, fields="id, webViewLink", supportsAllDrives=True,
+    ).execute()
+    file_id = created["id"]
+    if public:
+        try:
+            _make_public(svc, file_id)
+        except Exception:  # noqa: BLE001
+            pass
+    return created.get("webViewLink") or f"https://drive.google.com/file/d/{file_id}/view"
+
+
 def save_anywhere(telegram_id: int, filename: str, content: bytes,
                   mime_type: str) -> tuple[str | None, str]:
-    """Best-effort public upload: registered folder first, else a linked account's
-    own Drive. Returns (link_or_None, detail_message)."""
+    """Best-effort public upload, trying every place we might be able to write:
+    the registered folder, the sheet's own folder, then a linked account's Drive.
+    Returns (link_or_None, detail_message)."""
     errors = []
     _, folder_id = db.get_user_resources(telegram_id)
     if folder_id:
@@ -145,6 +177,11 @@ def save_anywhere(telegram_id: int, filename: str, content: bytes,
             return upload_file(telegram_id, filename, content, mime_type), "your Drive folder"
         except Exception as e:  # noqa: BLE001
             errors.append(f"shared folder: {e}")
+    try:
+        return (upload_beside_sheet(telegram_id, filename, content, mime_type),
+                "the folder holding your sheet")
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"sheet folder: {e}")
     for acct in db.list_google_accounts(telegram_id):
         try:
             link = upload_to_account(telegram_id, acct.email, filename, content, mime_type)
