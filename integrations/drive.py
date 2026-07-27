@@ -195,5 +195,9 @@ def save_anywhere(telegram_id: int, filename: str, content: bytes,
             errors.append(f"{acct.email}: {e}")
     if errors:
         return None, "; ".join(errors)
-    return None, ("no Drive connected — share a Drive folder with me (send its link) "
-                  "or link a Google account with /connect")
+    # Nothing to upload into. The service account has no Drive storage of its own,
+    # so a photo needs a folder a real person owns — spell out both ways to give one.
+    email = gservice.service_account_email(telegram_id) or "the bot's service account"
+    return None, ("no Drive to save it in yet. Either share a Google Drive folder with "
+                  f"{email} as Editor and send me its link, or run /connect to link your "
+                  "own Google account and I'll save receipts there")
