@@ -208,7 +208,14 @@ def append_mapped(telegram_id: int, fields: dict, tab: str | None = None,
     """
     real_tab = resolve_tab(telegram_id, tab, sheet_id) or tab
     headers = tab_headers(telegram_id, real_tab, sheet_id)
-    if not headers:                       # no header row — append values as given
+    if not headers:
+        # An empty tab (no header row yet) — borrow the layout from the first tab
+        # that has one, so the columns still line up with the rest of the sheet.
+        for t in list_tabs(telegram_id, sheet_id):
+            headers = tab_headers(telegram_id, t, sheet_id)
+            if headers:
+                break
+    if not headers:                       # a sheet with no headers anywhere
         _append(telegram_id, [str(v) for v in fields.values()], real_tab, sheet_id)
         return (real_tab or "first tab"), []
 
