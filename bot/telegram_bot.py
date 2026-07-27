@@ -535,93 +535,104 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await msg.reply_text(text_out)
 
 
-def _bill_facts(parsed: dict) -> str:
-    """The vision-extracted fields, as plain lines the brain can act on."""
-    keys = ("merchant", "amount", "kind", "category", "date", "note")
-    lines = [f"- {k}: {parsed[k]}" for k in keys if parsed.get(k) not in (None, "")]
-    return "\n".join(lines) or "- (nothing readable)"
-
-
-def _fallback_row(uid: int, caption: str, parsed: dict, tab: str | None,
-                  link: str | None) -> str:
-    """Write the entry ourselves when the AI talked instead of calling a tool.
-
-    Built only from what we actually know — the screenshot fields, the tab the
-    user named and the uploaded image link. Never invents an amount.
-    """
+def _amount_of(parsed: dict) -> float:
     try:
-        amount = float(parsed.get("amount") or 0)
+        return float(parsed.get("amount") or 0)
     except (TypeError, ValueError):
-        amount = 0.0
-    if amount <= 0:
-        return ""
-    fields = {
-        "date": datetime.now().strftime("%d/%m/%Y"),
-        "amount": f"{amount:.0f}" if amount == int(amount) else f"{amount:.2f}",
-        "transfer to": parsed.get("merchant") or "",
-        "reason": parsed.get("note") or parsed.get("category") or caption[:80],
-        "images": link or "",
-    }
+        return 0.0
+
+
+def _build_row(uid: int, caption: str, parsed: dict, tab: str, link: str | None,
+               content: bytes, mime: str) -> tuple[dict, list[str]]:
+    """Read the screenshot AGAINST the target tab: its columns and the rows already
+    in it. Returns (column -> value, headers)."""
+    headers = sheets.tab_headers(uid, tab)
+    if not headers:
+        return {}, []
+    existing = sheets.read_rows(uid, limit=8, tab=tab)[1:]      # drop the header row
     try:
-        used, _ = sheets.append_mapped(uid, fields, tab)
-    except Exception as e:  # noqa: BLE001
-        return f"\n⚠️ Couldn't write the row: {e}"
-    return f"\n✅ Row written to '{used}': {fields['transfer to']} — {fields['amount']}"
+        fields = vision.read_for_columns(content, headers, existing, caption, mime)
+    except Exception:  # noqa: BLE001 — fall back to the plain extraction below
+        fields = {}
+
+    # Fill anything vision-for-columns left out, and enforce what we know for sure.
+    def _slot(*names: str) -> str | None:
+        return sheets.find_column(headers, *names)
+
+    amount = _amount_of(parsed)
+    amt_col = _slot("amount", "amt")
+    if amt_col and amount > 0:                      # the amount is never guessed
+        fields[amt_col] = f"{amount:.0f}" if amount == int(amount) else f"{amount:.2f}"
+    date_col = _slot("date")
+    if date_col and not fields.get(date_col):
+        fields[date_col] = datetime.now().strftime("%d/%m/%Y")
+    img_col = _slot("images", "image", "screenshot", "attachment", "proof")
+    if img_col and link:
+        fields[img_col] = link
+    return fields, headers
 
 
 async def _photo_with_instruction(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int, caption: str,
     parsed: dict, filename: str, content: bytes, mime: str,
 ) -> None:
-    """Photo + caption = one instruction. Upload the image, hand the brain the
-    sheet's real layout, and make sure a row lands even if it doesn't act."""
+    """Photo + caption = one instruction, done in one shot: upload the image, read
+    the screenshot against the target tab's columns and existing rows, write the row."""
     msg = update.message
 
+    if db.count_sheets(uid) == 0:
+        return await msg.reply_text(
+            "I read the screenshot but you have no sheet connected yet.\n"
+            + tools.sheet_setup_help(uid))
+
     link, where = await asyncio.to_thread(drive.save_anywhere, uid, filename, content, mime)
-    image_line = (f"The image is ALREADY uploaded to Drive ({where}) and anyone with the "
-                  f"link can view it: {link}\nPut this exact URL in the image/screenshot "
-                  f"column — do not call upload_image_to_drive again."
-                  if link else
-                  f"The image could NOT be uploaded to Drive ({where}). Mention that in one "
-                  f"short line, but still write the sheet row.")
 
-    # Give the model the real tabs/columns up front so it can't stall on "which tab?".
-    layout, tab_hint = "", None
-    if db.count_sheets(uid) > 0:
-        try:
-            layout = await asyncio.to_thread(sheets.describe_structure, uid)
-            tab_hint = await asyncio.to_thread(sheets.tab_from_text, uid, caption)
-        except Exception:  # noqa: BLE001
-            layout = ""
-    layout_line = (f"Their connected sheet has these tabs and columns:\n{layout}\n"
-                   if layout else "")
-    tab_line = (f"The tab to write into is '{tab_hint}'.\n" if tab_hint else "")
-
-    prompt = (
-        f"{caption}\n\n"
-        f"[The user sent a payment screenshot with that message.]\n"
-        f"Details read from the screenshot:\n{_bill_facts(parsed)}\n"
-        f"{image_line}\n\n"
-        f"{layout_line}{tab_line}"
-        f"Call add_sheet_row NOW with that tab and the columns above filled in from the "
-        f"screenshot and the user's words. Use the amount from the screenshot exactly. "
-        f"Do not ask for confirmation and do not describe what you would do — do it, "
-        f"then report the row you wrote in one short line."
-    )
-
-    hist = db.recent_turns(uid, limit=12)
+    # Which tab? What the user named, else the first tab of their default sheet.
     try:
-        reply = await asyncio.to_thread(agent.handle_message, uid, prompt, hist)
+        tab = await asyncio.to_thread(sheets.tab_from_text, uid, caption)
+        tabs = await asyncio.to_thread(sheets.list_tabs, uid)
     except Exception as e:  # noqa: BLE001
-        reply = f"⚠️ Something went wrong: {e}"
+        return await msg.reply_text(f"⚠️ Couldn't open your sheet: {e}")
+    tab = tab or (tabs[0] if tabs else None)
+    if not tab:
+        return await msg.reply_text("Your sheet has no tabs I can write to.")
 
-    # Safety net: if it never wrote the row, write it ourselves. When the user
-    # named a tab, only add_sheet_row counts — log_transaction targets the
-    # default tab and would land in the wrong place.
-    calls = set(tools.called(uid))
-    wrote = "add_sheet_row" in calls or (not tab_hint and "log_transaction" in calls)
-    if not wrote and db.count_sheets(uid) > 0:
-        reply += await asyncio.to_thread(_fallback_row, uid, caption, parsed, tab_hint, link)
+    try:
+        fields, headers = await asyncio.to_thread(
+            _build_row, uid, caption, parsed, tab, link, content, mime)
+    except Exception as e:  # noqa: BLE001
+        return await msg.reply_text(f"⚠️ Couldn't read your sheet layout: {e}")
+
+    amount = _amount_of(parsed)
+    if not fields and amount <= 0:
+        return await msg.reply_text(
+            "I couldn't read an amount or any usable detail from that image. "
+            "Tell me the amount and I'll add the row.")
+
+    try:
+        used, unmatched = await asyncio.to_thread(sheets.append_mapped, uid, fields, tab)
+    except Exception as e:  # noqa: BLE001
+        return await msg.reply_text(f"⚠️ Couldn't write to your sheet: {e}")
+
+    # Keep the local ledger in step so summaries stay correct.
+    if amount > 0:
+        with db.session() as s:
+            s.add(db.Transaction(
+                telegram_id=uid, amount=amount,
+                kind="in" if parsed.get("kind") == "in" else "out",
+                category=(parsed.get("category") or "")[:80] or None,
+                note=(parsed.get("merchant") or parsed.get("note") or "bill")[:200],
+            ))
+            s.commit()
+
+    shown = "\n".join(f"• {h}: {fields[h]}" for h in headers if fields.get(h))
+    reply = f"✅ Added to '{used}':\n{shown}"
+    if link:
+        reply += f"\n\n📁 Screenshot on Drive ({where}), anyone with the link can view."
+    else:
+        reply += f"\n\n⚠️ Screenshot not uploaded ({where})."
+    if unmatched:
+        reply += f"\n(No column for: {', '.join(unmatched)})"
 
     db.save_turn(uid, "user", f"[photo] {caption}")
     db.save_turn(uid, "assistant", reply)

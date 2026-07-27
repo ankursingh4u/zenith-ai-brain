@@ -94,7 +94,6 @@ def handle_message(telegram_id: int, text: str, history: list[dict]) -> str:
     """Run one user turn. `history` is the prior [{'role','content'}, ...] for context."""
     # Record the exact user text for this turn (audit + money cross-check).
     tools.set_current_message(text)
-    tools.reset_calls(telegram_id)
 
     now = datetime.now(_TZ)
     sys = SYSTEM_PROMPT + (
@@ -120,7 +119,6 @@ def handle_message(telegram_id: int, text: str, history: list[dict]) -> str:
         messages.append(msg.model_dump(exclude_none=True))
         for call in msg.tool_calls:
             fn = tools.TOOLS.get(call.function.name)
-            tools.record_call(telegram_id, call.function.name)
             try:
                 args = json.loads(call.function.arguments or "{}")
                 # telegram_id is injected here — NOT taken from the model.

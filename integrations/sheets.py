@@ -145,6 +145,15 @@ def resolve_tab(telegram_id: int, hint: str | None, sheet_id: str | None = None)
     return None
 
 
+def find_column(headers: list[str], *names: str) -> str | None:
+    """The header matching any of `names` (ignoring case/spacing), or None."""
+    wanted = {_norm(n) for n in names}
+    for h in headers:
+        if _norm(h) in wanted:
+            return h
+    return None
+
+
 def tab_from_text(telegram_id: int, text: str, sheet_id: str | None = None) -> str | None:
     """Spot a tab name inside a free-text instruction, e.g. '... (Expense) tab'."""
     if not text:
