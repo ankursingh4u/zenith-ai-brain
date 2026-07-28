@@ -420,12 +420,43 @@ def _node_from(telegram_id: int, item: dict, parent_id: int | None,
     return made
 
 
-def add_plan(telegram_id: int, plan: list) -> str:
-    """Store a whole structured plan as a tree: tracks → phases → tasks/habits."""
+def clear_plan(telegram_id: int, track: str | None = None) -> str:
+    """Delete a whole track (with everything under it), or the entire plan."""
+    if track:
+        hits = db.find_tracks(telegram_id, track)
+        if not hits:
+            names = ", ".join(t.title for t in db.tracks(telegram_id)) or "nothing stored"
+            return f"No track matching '{track}'. You have: {names}."
+        gone = sum(db.delete_subtree(telegram_id, t.id) for t in hits)
+        killed = ", ".join(t.title for t in hits)
+        return f"🗑 Removed {killed} ({gone} items). Left: " + (
+            ", ".join(t.title for t in db.tracks(telegram_id)) or "nothing")
+    n = db.delete_all_tasks(telegram_id)
+    return f"🗑 Cleared your whole plan ({n} items). Send me the new one."
+
+
+def add_plan(telegram_id: int, plan: list, replace: bool = False) -> str:
+    """Store a whole structured plan as a tree: tracks → phases → tasks/habits.
+
+    `replace` wipes the existing plan first — otherwise re-sending a corrected
+    plan just stacks another copy of every track next to the old one.
+    """
     if isinstance(plan, dict):
         plan = [plan]
     if not plan:
         return "Empty plan."
+    wiped = ""
+    if replace:
+        n = db.delete_all_tasks(telegram_id)
+        wiped = f"Replaced the old plan ({n} items removed).\n"
+    else:
+        # Same-named track already there? Replace that one instead of duplicating.
+        for top in plan:
+            if isinstance(top, dict) and top.get("title"):
+                for old in db.find_tracks(telegram_id, str(top["title"])):
+                    if (old.title or "").strip().lower() == str(top["title"]).strip().lower():
+                        db.delete_subtree(telegram_id, old.id)
+                        wiped = "Updated the existing track(s) instead of duplicating.\n"
     total = 0
     names = []
     for i, top in enumerate(plan[:12]):
@@ -439,7 +470,7 @@ def add_plan(telegram_id: int, plan: list) -> str:
             names.append(f"{top.get('title')} ({n - 1} under it)")
     if not total:
         return "Nothing in that plan had a title I could use."
-    return ("🌳 Plan saved:\n" + "\n".join(f"• {n}" for n in names)
+    return (wiped + "🌳 Plan saved:\n" + "\n".join(f"• {n}" for n in names)
             + f"\n\n{total} nodes stored. Ask 'show plan' any time, or 'what now?'.")
 
 
@@ -953,6 +984,7 @@ TOOLS: dict[str, callable] = {
     "list_bill_accounts": list_bill_accounts,
     "add_tasks": add_tasks,
     "add_plan": add_plan,
+    "clear_plan": clear_plan,
     "recall": recall,
     "remember_about_me": remember_about_me,
     "my_profile": my_profile,
@@ -1058,8 +1090,11 @@ SCHEMAS: list[dict] = [
                       "due_iso": {"type": "string"},
                       "children": {"type": "array", "items": {"type": "object"},
                                    "description": "Nested nodes, same shape."},
-                  }, "required": ["title"]}}},
+                  }, "required": ["title"]}},
+         "replace": {"type": "boolean", "description": "TRUE when the user is redoing/correcting their plan — wipes the old one first so tracks don't stack up. Default false."}},
         ["plan"]),
+    _fn("clear_plan", "Delete a track and everything under it, or the whole plan. Use when the user says remove/delete/clear/start over with their plan. This is their own local data — deleting it is allowed.",
+        {"track": {"type": "string", "description": "Track name to remove, e.g. 'Life'. Omit to clear the ENTIRE plan."}}),
     _fn("show_plan", "Show the stored plan as a tree with progress bars and gates. Use for 'show my plan', 'where am I', 'progress'.",
         {"track": {"type": "string", "description": "Zoom into one area, e.g. 'DSA'. Omit for all."},
          "depth": {"type": "integer", "description": "How deep to show. Default 2."}}),

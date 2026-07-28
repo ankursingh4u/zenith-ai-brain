@@ -1045,6 +1045,38 @@ def open_leaves(telegram_id: int, track: str | None = None, limit: int = 200) ->
         return leaves
 
 
+def delete_subtree(telegram_id: int, node_id: int) -> int:
+    """Delete a node and everything under it. Returns how many rows went."""
+    kids = children(telegram_id, node_id)
+    gone = 0
+    for k in kids:
+        gone += delete_subtree(telegram_id, k.id)
+    with session() as s:
+        t = s.get(Task, node_id)
+        if t is not None and t.telegram_id == telegram_id:   # ownership check
+            s.delete(t)
+            s.commit()
+            gone += 1
+    return gone
+
+
+def delete_all_tasks(telegram_id: int) -> int:
+    """Wipe this user's whole plan/task list. Only ever their own rows."""
+    with session() as s:
+        rows = s.scalars(select(Task).where(Task.telegram_id == telegram_id)).all()
+        n = len(rows)
+        for r in rows:
+            s.delete(r)
+        s.commit()
+        return n
+
+
+def find_tracks(telegram_id: int, name: str) -> list["Task"]:
+    """Top-level tracks whose title matches — used to replace or drop one."""
+    n = (name or "").strip().lower()
+    return [t for t in tracks(telegram_id) if n and n in (t.title or "").lower()]
+
+
 def add_reminder(telegram_id: int, text: str, due_at: datetime) -> int:
     with session() as s:
         r = Reminder(telegram_id=telegram_id, text=text, due_at=due_at)
