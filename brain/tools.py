@@ -459,6 +459,40 @@ def show_plan(telegram_id: int, track: str | None = None, depth: int = 2) -> str
     return "\n".join(out).strip()
 
 
+def plan_snapshot(telegram_id: int, max_chars: int = 1200) -> str:
+    """A compact always-on view of the plan for the system prompt.
+
+    Only what's needed to stay aware: each track, the phase currently in play,
+    its gate and progress, and habits. Kept small — show_plan gives the full tree.
+    """
+    tops = db.tracks(telegram_id)
+    if not tops:
+        return ""
+    out = []
+    for t in tops:
+        done, total = db.subtree_stats(telegram_id, t.id)
+        head = f"{t.title}"
+        if total:
+            head += f" ({done}/{total} done)"
+        kids = [k for k in db.children(telegram_id, t.id) if k.status == "open"]
+        habit_kids = [k for k in kids if k.kind == "habit"]
+        work_kids = [k for k in kids if k.kind != "habit"]
+        if work_kids:
+            cur = work_kids[0]
+            bit = f" — now: {cur.title}"
+            if cur.target:
+                bit += f" [{cur.progress or 0}/{cur.target}]"
+            if cur.gate:
+                bit += f" (gate: {cur.gate})"
+            head += bit
+        if habit_kids:
+            head += " — habits: " + ", ".join(
+                h.title + (f" 🔥{h.streak}" if h.streak else "") for h in habit_kids)
+        out.append("• " + head)
+    text = "\n".join(out)
+    return text[:max_chars] + ("…" if len(text) > max_chars else "")
+
+
 def what_now(telegram_id: int) -> str:
     """The single next thing to do, decided from the plan — not from memory."""
     now_local = datetime.now(_TZ)

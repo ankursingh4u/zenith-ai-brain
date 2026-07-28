@@ -63,6 +63,8 @@ PLANS (roadmaps, phases, long-term goals) — use add_plan, not add_tasks:
 - 'show plan', 'where am I', 'progress' → show_plan.
 - 'solved 5 problems', 'did 2 designs' → log_progress. 'did calisthenics', 'posted on X' → check_habit.
 - Progress is measured by gates cleared, not hours logged — say so if they start counting hours.
+- BIG PASTED PLANS: if they paste a long roadmap — tables of phases with topics, resources, gates, counts, rules, a daily schedule — do NOT reply with a summary and lose it. Call add_plan and store the WHOLE thing as a tree, one track per big area, one phase per row, the gate column into `gate`, the count into `target`, resources/rules into `notes`, and their daily/weekly routine items as habits. Then confirm what you stored.
+- STAY AWARE: their live plan is in your context every turn (see THEIR PLAN RIGHT NOW). Refer to it naturally — if they mention something that belongs to a phase, connect it; if they ask "should I do X", answer against the phase they're actually on and its gate; if they've stalled on a phase, say so plainly. Never claim you don't know their plan when it's shown to you.
 - Passwords & secrets: save, retrieve, list and delete credentials in an encrypted vault.
 - Google Sheet & Drive (share model): the user shares THEIR own sheet/folder with the bot's email and sends the link — use register_sheet / register_drive_folder when they paste a Google link, and sheet_setup_help when they ask how. read_sheet lets you read their data and reason over it.
 - Gmail, Calendar, Docs, Drive (if the user linked Google accounts via /connect): read_emails, send_email, add_calendar_event, list_schedule, create_document, list_drive_files, analyze_statement, list_accounts. The user can link SEVERAL Google accounts — if a tool asks "which account?", relay that question and pass the user's choice as the `account` argument. If a tool says to /connect, relay that helpfully.
@@ -128,7 +130,16 @@ def handle_message(telegram_id: int, text: str, history: list[dict]) -> str:
         "\n\nYOUR USER: nothing recorded yet. Stay neutral, don't assume their field, "
         "and save anything durable they tell you with remember_about_me."
     )
-    sys = SYSTEM_PROMPT + who + (
+    # The plan travels with every turn, so the assistant is always aware of it
+    # instead of only when it happens to call a tool.
+    snapshot = tools.plan_snapshot(telegram_id)
+    plan_ctx = (
+        f"\n\nTHEIR PLAN RIGHT NOW (live — always true, refer to it naturally):\n{snapshot}"
+        "\nUse show_plan for the full tree, what_now to decide the next move, "
+        "log_progress/check_habit/complete_task to record what they report."
+        if snapshot else ""
+    )
+    sys = SYSTEM_PROMPT + who + plan_ctx + (
         f"\nCURRENT TIME: {now:%A %d %B %Y, %H:%M} ({config.TIMEZONE}). "
         f"Use this for all relative times ('tomorrow', 'in 2 hours', 'next Monday')."
     )
