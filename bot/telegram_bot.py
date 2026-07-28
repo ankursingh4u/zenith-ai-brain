@@ -726,6 +726,36 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await msg.reply_text(text_out)
 
 
+async def _text_document(update: Update, uid: int, caption: str,
+                         content: bytes, filename: str) -> None:
+    """A .md/.txt/.csv upload: read it and act on it, with the caption as the ask."""
+    text = content.decode("utf-8", errors="replace").strip()
+    if not text:
+        return await update.message.reply_text("That file looks empty.")
+    log.info("text document from %s: %s (%d chars)", uid, filename, len(text))
+
+    # Long files are truncated rather than refused — say so if it happens.
+    LIMIT = 24000
+    clipped = len(text) > LIMIT
+    body = text[:LIMIT]
+    ask = caption or "Store this properly and tell me what you did with it."
+    prompt = (f"{ask}\n\n[The user uploaded a file: {filename}"
+              f"{' — truncated, it was longer' if clipped else ''}]\n"
+              f"--- file contents ---\n{body}\n--- end of file ---")
+
+    hist = db.recent_turns(uid, limit=agent.HISTORY_TURNS)
+    try:
+        reply = await asyncio.to_thread(agent.handle_message, uid, prompt, hist)
+    except Exception as e:  # noqa: BLE001
+        log.exception("text document failed")
+        reply = f"⚠️ Something went wrong: {e}"
+    if clipped:
+        reply += f"\n\n(Only the first {LIMIT} characters were read.)"
+    db.save_turn(uid, "user", f"[file {filename}] {caption}")
+    db.save_turn(uid, "assistant", reply)
+    await update.message.reply_text(reply[:3900])
+
+
 def _amount_of(parsed: dict) -> float:
     try:
         return float(parsed.get("amount") or 0)
@@ -865,6 +895,13 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     content = bytes(await tg_file.download_as_bytearray())
     caption = (msg.caption or "").strip()
+
+    # A text/markdown file is CONTENT, not a receipt — the way to hand over
+    # something longer than Telegram's 4096-char message limit (a whole plan,
+    # notes, a log). Read it and let the brain act on it.
+    name_l = (getattr(msg.document, "file_name", "") or "").lower()
+    if mime.startswith("text/") or name_l.endswith((".md", ".txt", ".csv", ".json", ".log")):
+        return await _text_document(update, uid, caption, content, name_l or "file")
     slug = (caption or "bill").replace(" ", "_")[:40]
     filename = f"{datetime.now():%Y%m%d_%H%M%S}_{slug}.{ext}"
 
