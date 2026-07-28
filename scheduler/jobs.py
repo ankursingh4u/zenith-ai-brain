@@ -52,6 +52,17 @@ async def run_daily_check(bot) -> None:
                       f"⏰ Reminder: {acc.name} bill is due {when} (day {acc.due_day}).")
 
 
+async def send_task_digest(bot) -> None:
+    """Daily: one line per person about what's still open, overdue first."""
+    from brain import tools
+    for uid in db.users_with_open_tasks():
+        rows = db.list_tasks(uid, "open", limit=10)
+        if not rows:
+            continue
+        body = tools.list_open_tasks(uid, "all")
+        await _notify(bot, uid, f"☀️ Good morning — here's what's still open.\n\n{body}")
+
+
 def start_scheduler(application) -> AsyncIOScheduler:
     """Start the jobs on the bot's running event loop (called from post_init)."""
     scheduler = AsyncIOScheduler(timezone=config.TIMEZONE)
@@ -62,6 +73,10 @@ def start_scheduler(application) -> AsyncIOScheduler:
     scheduler.add_job(
         fire_due_reminders, trigger=IntervalTrigger(minutes=1),
         args=[application.bot], id="reminders", replace_existing=True,
+    )
+    scheduler.add_job(
+        send_task_digest, trigger=CronTrigger(hour=config.DAILY_JOB_HOUR, minute=5),
+        args=[application.bot], id="task_digest", replace_existing=True,
     )
     scheduler.start()
     log.info("Scheduler started — daily bill check at %02d:00 %s, reminders every minute.",

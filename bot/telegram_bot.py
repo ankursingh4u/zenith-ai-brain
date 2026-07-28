@@ -270,6 +270,68 @@ async def _send_add_flow(chat_id: int, uid: int, ctx: ContextTypes.DEFAULT_TYPE)
                               disable_web_page_preview=True)
 
 
+def _tasks_keyboard(uid: int) -> InlineKeyboardMarkup:
+    """The task menu. 'Done' rows are added per-task so ticking off is one tap."""
+    rows = [[
+        InlineKeyboardButton("📋 Pending", callback_data="task:open"),
+        InlineKeyboardButton("📅 Today", callback_data="task:today"),
+    ], [
+        InlineKeyboardButton("⚠️ Overdue", callback_data="task:overdue"),
+        InlineKeyboardButton("✅ Done list", callback_data="task:done"),
+    ], [
+        InlineKeyboardButton("✔️ Tick one off", callback_data="task:tick"),
+        InlineKeyboardButton("⏰ Reminders", callback_data="task:rem"),
+    ]]
+    return InlineKeyboardMarkup(rows)
+
+
+async def tasks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """The task hub. Everything here is also reachable by just talking to the bot."""
+    if not await _gate(update):
+        return
+    uid = update.effective_user.id
+    db.get_or_create_user(uid, update.effective_user.full_name)
+    open_n = db.count_open_tasks(uid)
+    head = (f"🗂 You have {open_n} open task(s)." if open_n else "🗂 No open tasks. 🎉")
+    await update.message.reply_text(
+        head + "\n\nTap below, or just tell me things like:\n"
+        "• \"pamposh cleaner pending, call bank about the 5000, kirti salary friday\"\n"
+        "• \"what's pending?\"   • \"mark the bank one done\"",
+        reply_markup=_tasks_keyboard(uid))
+
+
+async def _task_callback(q, uid: int, data: str, chat_id: int, ctx) -> None:
+    """Handle the task menu taps."""
+    if data == "task:open":
+        await ctx.bot.send_message(chat_id, tools.list_open_tasks(uid, "all"),
+                                   reply_markup=_tasks_keyboard(uid))
+    elif data == "task:today":
+        await ctx.bot.send_message(chat_id, tools.list_open_tasks(uid, "today"),
+                                   reply_markup=_tasks_keyboard(uid))
+    elif data == "task:overdue":
+        await ctx.bot.send_message(chat_id, tools.list_open_tasks(uid, "overdue"),
+                                   reply_markup=_tasks_keyboard(uid))
+    elif data == "task:done":
+        rows = db.list_tasks(uid, "done", limit=15)
+        body = ("Recently finished:\n" + "\n".join(f"✅ {t.title}" for t in rows)
+                if rows else "Nothing ticked off yet.")
+        await ctx.bot.send_message(chat_id, body, reply_markup=_tasks_keyboard(uid))
+    elif data == "task:tick":
+        rows = db.list_tasks(uid, "open", limit=10)
+        if not rows:
+            return await ctx.bot.send_message(chat_id, "No open tasks. 🎉")
+        kb = [[InlineKeyboardButton(f"✔️ {t.title[:45]}", callback_data=f"tdone:{t.id}")]
+              for t in rows]
+        await ctx.bot.send_message(chat_id, "Which one is done?",
+                                   reply_markup=InlineKeyboardMarkup(kb))
+    elif data.startswith("tdone:"):
+        await ctx.bot.send_message(chat_id, tools.complete_task(uid, int(data[6:])),
+                                   reply_markup=_tasks_keyboard(uid))
+    elif data == "task:rem":
+        await ctx.bot.send_message(chat_id, tools.list_reminders(uid),
+                                   reply_markup=_tasks_keyboard(uid))
+
+
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     uid = q.from_user.id
@@ -278,6 +340,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await q.answer()
     data = q.data or ""
     chat_id = q.message.chat_id
+
+    if data.startswith("task:") or data.startswith("tdone:"):
+        return await _task_callback(q, uid, data, chat_id, ctx)
 
     if data in ("conn:add", "conn:guide"):
         await _send_add_flow(chat_id, uid, ctx)
@@ -761,6 +826,7 @@ async def _post_init(app: Application) -> None:
         BotCommand("start", "What I can do"),
         BotCommand("help", "Show all commands and examples"),
         BotCommand("connect", "Connect a Sheet or your Google account"),
+        BotCommand("tasks", "Your task list — pending, today, tick off"),
         BotCommand("sheets", "See or switch your connected Sheets"),
         BotCommand("accounts", "Switch or add Google accounts"),
         BotCommand("addmail", "Connect an email mailbox (Migadu, Zoho, IMAP)"),
@@ -784,6 +850,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("connect", connect))
     app.add_handler(CommandHandler("accounts", accounts))
     app.add_handler(CommandHandler("sheets", sheets_cmd))
+    app.add_handler(CommandHandler("tasks", tasks_cmd))
     app.add_handler(CommandHandler("addmail", addmail))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("version", version))

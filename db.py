@@ -154,6 +154,26 @@ class Reminder(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class Task(Base):
+    """An open piece of work. Unlike a Reminder it has no required time — it sits
+    in the list until it's done, which is what makes 'what's pending?' answerable."""
+    __tablename__ = "tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    telegram_id: Mapped[int] = mapped_column(
+        ForeignKey("users.telegram_id"), index=True, nullable=False
+    )
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+    # open | done | dropped
+    status: Mapped[str] = mapped_column(String(10), default="open", index=True)
+    # 1 = urgent, 2 = normal, 3 = whenever
+    priority: Mapped[int] = mapped_column(default=2)
+    due_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)  # UTC, optional
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    done_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+
 class ConversationTurn(Base):
     """One message in a user's chat history, kept so context survives restarts.
 
@@ -766,6 +786,103 @@ def remove_sheet(telegram_id: int, sheet_id: str) -> bool:
 
 
 # --- Reminder helpers -----------------------------------------------------
+# --- Tasks ---------------------------------------------------------------
+def add_task(telegram_id: int, title: str, notes: str | None = None,
+             priority: int = 2, due_at: datetime | None = None) -> int:
+    with session() as s:
+        t = Task(telegram_id=telegram_id, title=title.strip(), notes=notes,
+                 priority=max(1, min(int(priority or 2), 3)), due_at=due_at)
+        s.add(t)
+        s.commit()
+        return t.id
+
+
+def list_tasks(telegram_id: int, status: str = "open", limit: int = 100,
+               due_before: datetime | None = None) -> list["Task"]:
+    """Open tasks come back urgent-first, then soonest due, then oldest."""
+    with session() as s:
+        stmt = select(Task).where(Task.telegram_id == telegram_id)
+        if status != "all":
+            stmt = stmt.where(Task.status == status)
+        if due_before is not None:
+            stmt = stmt.where(Task.due_at.is_not(None), Task.due_at <= due_before)
+        if status == "done":
+            stmt = stmt.order_by(Task.done_at.desc())
+        else:
+            stmt = stmt.order_by(Task.priority, Task.due_at.is_(None), Task.due_at, Task.id)
+        rows = s.scalars(stmt.limit(limit)).all()
+        for r in rows:
+            s.expunge(r)
+        return list(rows)
+
+
+def count_open_tasks(telegram_id: int) -> int:
+    with session() as s:
+        return s.scalar(select(func.count()).select_from(Task).where(
+            Task.telegram_id == telegram_id, Task.status == "open")) or 0
+
+
+def get_task(telegram_id: int, task_id: int) -> "Task | None":
+    with session() as s:
+        t = s.get(Task, task_id)
+        if t is None or t.telegram_id != telegram_id:   # ownership check
+            return None
+        s.expunge(t)
+        return t
+
+
+def set_task_status(telegram_id: int, task_id: int, status: str) -> "Task | None":
+    with session() as s:
+        t = s.get(Task, task_id)
+        if t is None or t.telegram_id != telegram_id:   # ownership check
+            return None
+        t.status = status
+        t.done_at = datetime.utcnow() if status in ("done", "dropped") else None
+        s.commit()
+        s.refresh(t)          # commit expires the attributes — reload before detaching
+        s.expunge(t)
+        return t
+
+
+def update_task(telegram_id: int, task_id: int, title: str | None = None,
+                notes: str | None = None, priority: int | None = None,
+                due_at: datetime | None = None, clear_due: bool = False) -> "Task | None":
+    with session() as s:
+        t = s.get(Task, task_id)
+        if t is None or t.telegram_id != telegram_id:   # ownership check
+            return None
+        if title is not None:
+            t.title = title.strip()
+        if notes is not None:
+            t.notes = notes
+        if priority is not None:
+            t.priority = max(1, min(int(priority), 3))
+        if clear_due:
+            t.due_at = None
+        elif due_at is not None:
+            t.due_at = due_at
+        s.commit()
+        s.refresh(t)          # commit expires the attributes — reload before detaching
+        s.expunge(t)
+        return t
+
+
+def find_tasks(telegram_id: int, text: str, status: str = "open") -> list["Task"]:
+    """Match open tasks by a word or two from their title — for 'mark X done'."""
+    needle = (text or "").strip().lower()
+    if not needle:
+        return []
+    return [t for t in list_tasks(telegram_id, status=status, limit=200)
+            if needle in (t.title or "").lower()]
+
+
+def users_with_open_tasks() -> list[int]:
+    """Telegram ids that have at least one open task (for the daily digest)."""
+    with session() as s:
+        return list(s.scalars(select(Task.telegram_id).where(
+            Task.status == "open").distinct()).all())
+
+
 def add_reminder(telegram_id: int, text: str, due_at: datetime) -> int:
     with session() as s:
         r = Reminder(telegram_id=telegram_id, text=text, due_at=due_at)

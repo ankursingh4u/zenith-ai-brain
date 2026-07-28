@@ -226,6 +226,116 @@ def cancel_reminder(telegram_id: int, reminder_id: int) -> str:
 
 
 # =========================================================================
+#  Tasks — open work that has no required time (unlike a reminder)
+# =========================================================================
+_PRIORITY_LABEL = {1: "🔴", 2: "🟡", 3: "⚪"}
+
+
+def _due_utc(when_iso: str | None) -> datetime | None:
+    if not when_iso:
+        return None
+    try:
+        local = datetime.fromisoformat(when_iso)
+    except ValueError:
+        return None
+    if local.tzinfo is None:
+        local = local.replace(tzinfo=_TZ)
+    return local.astimezone(_UTC).replace(tzinfo=None)
+
+
+def _task_line(t) -> str:
+    mark = _PRIORITY_LABEL.get(t.priority, "🟡")
+    line = f"{mark} #{t.id} {t.title}"
+    if t.due_at:
+        line += f" — due {t.due_at.replace(tzinfo=_UTC).astimezone(_TZ):%a %d %b}"
+    if t.notes:
+        line += f"\n     {t.notes}"
+    return line
+
+
+def add_tasks(telegram_id: int, tasks: list) -> str:
+    """Add one or many tasks. Use for a messy brain-dump: split it into separate items."""
+    if isinstance(tasks, (str, dict)):
+        tasks = [tasks]
+    if not tasks:
+        return "No tasks given."
+    added = []
+    for item in tasks[:40]:
+        if isinstance(item, str):
+            item = {"title": item}
+        title = str(item.get("title") or "").strip()
+        if not title:
+            continue
+        tid = db.add_task(
+            telegram_id, title, (item.get("notes") or None),
+            int(item.get("priority") or 2), _due_utc(item.get("due_iso")),
+        )
+        added.append(f"#{tid} {title}")
+    if not added:
+        return "None of those had a title I could use."
+    total = db.count_open_tasks(telegram_id)
+    return (f"📝 Added {len(added)} task(s):\n" + "\n".join(f"• {a}" for a in added)
+            + f"\n\n{total} open in total.")
+
+
+def list_open_tasks(telegram_id: int, when: str = "all") -> str:
+    """List the user's open tasks. `when`: all | today | overdue."""
+    now_local = datetime.now(_TZ)
+    cutoff = None
+    if when == "today":
+        end = now_local.replace(hour=23, minute=59, second=59)
+        cutoff = end.astimezone(_UTC).replace(tzinfo=None)
+    elif when == "overdue":
+        cutoff = now_local.astimezone(_UTC).replace(tzinfo=None)
+    rows = db.list_tasks(telegram_id, "open", due_before=cutoff)
+    if not rows:
+        if when == "today":
+            return "Nothing due today. 🎉"
+        if when == "overdue":
+            return "Nothing overdue. 🎉"
+        return "No open tasks. 🎉"
+    head = {"today": "Due today", "overdue": "Overdue"}.get(when, "Open tasks")
+    return f"{head} ({len(rows)}):\n" + "\n".join(_task_line(t) for t in rows)
+
+
+def complete_task(telegram_id: int, task_id: int | None = None,
+                  title: str | None = None) -> str:
+    """Tick a task off, by its id or by a word from its title."""
+    if task_id is None and title:
+        matches = db.find_tasks(telegram_id, title)
+        if not matches:
+            return f"No open task matching '{title}'."
+        if len(matches) > 1:
+            return ("Which one?\n" + "\n".join(_task_line(t) for t in matches[:8]))
+        task_id = matches[0].id
+    if task_id is None:
+        return "Tell me which task — its number or a word from it."
+    t = db.set_task_status(telegram_id, int(task_id), "done")
+    if t is None:
+        return f"No task #{task_id}."
+    return f"✅ Done: {t.title}\n{db.count_open_tasks(telegram_id)} still open."
+
+
+def update_task(telegram_id: int, task_id: int, title: str | None = None,
+                notes: str | None = None, priority: int | None = None,
+                due_iso: str | None = None) -> str:
+    """Change a task's title, notes, priority or due date."""
+    t = db.update_task(telegram_id, int(task_id), title, notes, priority,
+                       _due_utc(due_iso))
+    if t is None:
+        return f"No task #{task_id}."
+    return "✏️ Updated:\n" + _task_line(t)
+
+
+def drop_task(telegram_id: int, task_id: int) -> str:
+    """Remove a task that's no longer needed (not done — just cancelled)."""
+    t = db.set_task_status(telegram_id, int(task_id), "dropped")
+    if t is None:
+        return f"No task #{task_id}."
+    return f"🗑 Dropped: {t.title}"
+
+
+# =========================================================================
 #  Password vault (encrypted at rest)
 # =========================================================================
 def save_password(telegram_id: int, name: str, secret: str, username: str | None = None) -> str:
@@ -573,6 +683,11 @@ TOOLS: dict[str, callable] = {
     "get_summary": get_summary,
     "add_bill_account": add_bill_account,
     "list_bill_accounts": list_bill_accounts,
+    "add_tasks": add_tasks,
+    "list_open_tasks": list_open_tasks,
+    "complete_task": complete_task,
+    "update_task": update_task,
+    "drop_task": drop_task,
     "set_reminder": set_reminder,
     "list_reminders": list_reminders,
     "cancel_reminder": cancel_reminder,
@@ -630,6 +745,29 @@ SCHEMAS: list[dict] = [
          "statement_day": {"type": "integer", "description": "Day of month the statement arrives (1-31). Optional."}},
         ["name"]),
     _fn("list_bill_accounts", "List tracked bills.", {}),
+
+    _fn("add_tasks", "Add one or MANY tasks at once. When the user dumps several problems/jobs in one message, split it and pass every one of them here in a single call — never drop any.",
+        {"tasks": {"type": "array", "description": "One entry per job to track.",
+                   "items": {"type": "object", "properties": {
+                       "title": {"type": "string", "description": "Short action, e.g. 'Call bank about the 5000'."},
+                       "notes": {"type": "string", "description": "Any detail worth keeping. Optional."},
+                       "priority": {"type": "integer", "description": "1 urgent, 2 normal (default), 3 whenever."},
+                       "due_iso": {"type": "string", "description": "Local ISO datetime if they gave a deadline, e.g. 2026-07-31T18:00:00. Omit if none."},
+                   }, "required": ["title"]}}},
+        ["tasks"]),
+    _fn("list_open_tasks", "List the user's open/pending tasks. Use when they ask what's pending, what's left, or what's due.",
+        {"when": {"type": "string", "enum": ["all", "today", "overdue"],
+                  "description": "'today' = due by tonight, 'overdue' = past due. Default 'all'."}}),
+    _fn("complete_task", "Tick a task off once it's done. Give the id, or a word from its title.",
+        {"task_id": {"type": "integer", "description": "The #number shown in the list."},
+         "title": {"type": "string", "description": "A word or two from the task, if no id."}}),
+    _fn("update_task", "Change a task's title, notes, priority or due date.",
+        {"task_id": {"type": "integer"}, "title": {"type": "string"},
+         "notes": {"type": "string"}, "priority": {"type": "integer"},
+         "due_iso": {"type": "string", "description": "New local ISO due datetime."}},
+        ["task_id"]),
+    _fn("drop_task", "Cancel a task that's no longer needed (it wasn't done).",
+        {"task_id": {"type": "integer"}}, ["task_id"]),
 
     _fn("set_reminder", "Set a time-based reminder. Compute the exact local datetime from the user's words using the current time given to you.",
         {"text": {"type": "string", "description": "What to remind about."},
