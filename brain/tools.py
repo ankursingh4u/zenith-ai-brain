@@ -298,18 +298,36 @@ def list_open_tasks(telegram_id: int, when: str = "all") -> str:
     return f"{head} ({len(rows)}):\n" + "\n".join(_task_line(t) for t in rows)
 
 
+def _pick_task(telegram_id: int, task_id, title: str | None):
+    """Resolve a task from an id and/or a word from its title.
+
+    Models often send a placeholder id (0) alongside the title, so a falsy id is
+    treated as 'not given', and a bad id still falls back to the title.
+    """
+    try:
+        tid = int(task_id) if task_id not in (None, "") else None
+    except (TypeError, ValueError):
+        tid = None
+    if tid is not None and tid > 0 and db.get_task(telegram_id, tid) is not None:
+        return tid, None
+    if title:
+        matches = db.find_tasks(telegram_id, title)
+        if len(matches) == 1:
+            return matches[0].id, None
+        if len(matches) > 1:
+            return None, "Which one?\n" + "\n".join(_task_line(t) for t in matches[:8])
+        return None, f"No open task matching '{title}'."
+    if tid is not None and tid > 0:
+        return None, f"No task #{tid}."
+    return None, "Tell me which task — its number or a word from it."
+
+
 def complete_task(telegram_id: int, task_id: int | None = None,
                   title: str | None = None) -> str:
     """Tick a task off, by its id or by a word from its title."""
-    if task_id is None and title:
-        matches = db.find_tasks(telegram_id, title)
-        if not matches:
-            return f"No open task matching '{title}'."
-        if len(matches) > 1:
-            return ("Which one?\n" + "\n".join(_task_line(t) for t in matches[:8]))
-        task_id = matches[0].id
-    if task_id is None:
-        return "Tell me which task — its number or a word from it."
+    task_id, problem = _pick_task(telegram_id, task_id, title)
+    if problem:
+        return problem
     t = db.set_task_status(telegram_id, int(task_id), "done")
     if t is None:
         return f"No task #{task_id}."
@@ -553,15 +571,9 @@ def what_now(telegram_id: int) -> str:
 def log_progress(telegram_id: int, task_id: int | None = None,
                  title: str | None = None, count: int = 1) -> str:
     """Record countable progress — 'solved 5 problems', 'did 2 designs'."""
-    if task_id is None and title:
-        matches = db.find_tasks(telegram_id, title)
-        if not matches:
-            return f"No open item matching '{title}'."
-        if len(matches) > 1:
-            return "Which one?\n" + "\n".join(_task_line(t) for t in matches[:8])
-        task_id = matches[0].id
-    if task_id is None:
-        return "Tell me which item — its number or a word from it."
+    task_id, problem = _pick_task(telegram_id, task_id, title)
+    if problem:
+        return problem
     t = db.bump_progress(telegram_id, int(task_id), int(count or 1))
     if t is None:
         return f"No task #{task_id}."

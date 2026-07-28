@@ -4,11 +4,8 @@ from __future__ import annotations
 import base64
 import json
 
-from openai import OpenAI
-
 import config
-
-_client = OpenAI(api_key=config.OPENAI_API_KEY)
+from brain import llm
 
 _PROMPT = (
     "You are reading a photo of a bill, receipt, or payment screenshot. "
@@ -57,8 +54,8 @@ def read_for_columns(
         f"WHAT THE USER TYPED WITH THE SCREENSHOT: {caption or '(nothing)'}"
     )
     b64 = base64.b64encode(image_bytes).decode()
-    resp = _client.chat.completions.create(
-        model=config.FAST_MODEL,
+    resp = llm.client().chat.completions.create(
+        model=config.VISION_MODEL,
         messages=[{
             "role": "user",
             "content": [
@@ -86,8 +83,8 @@ def read_for_columns(
 def read_bill(image_bytes: bytes, mime: str = "image/jpeg") -> dict:
     """Return {merchant, amount, kind, category, date, note}. amount=0 if unreadable."""
     b64 = base64.b64encode(image_bytes).decode()
-    resp = _client.chat.completions.create(
-        model=config.FAST_MODEL,             # narrow extraction — cheap is fine
+    resp = llm.client().chat.completions.create(
+        model=config.VISION_MODEL,           # must genuinely read images
         messages=[{
             "role": "user",
             "content": [

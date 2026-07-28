@@ -11,7 +11,6 @@ import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from openai import OpenAI
 
 
 def _strip_markdown(t: str) -> str:
@@ -29,9 +28,8 @@ def _strip_markdown(t: str) -> str:
 
 import config
 import db
-from brain import tools
+from brain import llm, tools
 
-_client = OpenAI(api_key=config.OPENAI_API_KEY)
 _TZ = ZoneInfo(config.TIMEZONE)
 
 SYSTEM_PROMPT = """You are Brain — a highly capable, proactive personal assistant reachable on Telegram. You are the user's second brain.
@@ -138,7 +136,7 @@ def _complete(**kwargs):
             continue
         tried.append(model)
         try:
-            resp = _client.chat.completions.create(model=model, **kwargs)
+            resp = llm.client().chat.completions.create(model=model, **kwargs)
             if _model_in_use != model:
                 _model_in_use = model
             return resp

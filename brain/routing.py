@@ -8,11 +8,8 @@ from __future__ import annotations
 
 import json
 
-from openai import OpenAI
-
 import config
-
-_client = OpenAI(api_key=config.OPENAI_API_KEY)
+from brain import llm
 
 _PROMPT = (
     "You route a payment entry into the right tab of a bookkeeping spreadsheet.\n"
@@ -44,7 +41,7 @@ def choose_tab(tabs: dict[str, list[str]], caption: str, facts: dict) -> tuple[s
     )
     detail = ", ".join(f"{k}={v}" for k, v in facts.items() if v not in (None, ""))
     try:
-        resp = _client.chat.completions.create(
+        resp = llm.client().chat.completions.create(
             model=config.FAST_MODEL,
             messages=[{"role": "user", "content": (
                 f"{_PROMPT}\n\nTABS:\n{layout}\n\n"

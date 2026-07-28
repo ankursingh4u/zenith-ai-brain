@@ -22,15 +22,24 @@ TELEGRAM_BOT_TOKEN = _required("TELEGRAM_BOT_TOKEN")
 
 # --- OpenAI ---
 OPENAI_API_KEY = _required("OPENAI_API_KEY")
-# The reasoning brain — conversation, planning, code, advice. Worth the money:
-# this is the single biggest lever on how smart the bot feels.
+# --- LLM provider (any OpenAI-compatible endpoint) ---
+# Leave LLM_BASE_URL empty to use OpenAI directly; set it to a gateway's /v1 to
+# route chat + vision elsewhere. Speech (whisper/tts) always stays on OpenAI.
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "").strip()
+LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip() or OPENAI_API_KEY
+
+# The reasoning brain — conversation, planning, code, advice. The single
+# biggest lever on how smart the bot feels.
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o").strip()
-# Tried in order if OPENAI_MODEL isn't available on this account, so a model
-# name the key can't use degrades instead of breaking every reply.
+# Tried in order if OPENAI_MODEL isn't available, so a name this key can't use
+# degrades instead of breaking every reply.
 MODEL_FALLBACKS = [m.strip() for m in os.getenv(
     "MODEL_FALLBACKS", "gpt-4o,gpt-4o-mini").split(",") if m.strip()]
-# Narrow, high-volume jobs (reading a receipt, picking a tab) — cheap is fine.
+# Narrow, high-volume text jobs (picking a sheet tab) — cheap is fine.
 FAST_MODEL = os.getenv("FAST_MODEL", "gpt-4o-mini").strip()
+# Reading receipts. MUST be a model that actually sees images — some gateway
+# aliases accept an image and silently return nulls, which loses every receipt.
+VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o").strip()
 
 # --- Voice (speech-to-text + text-to-speech) ---
 STT_MODEL = os.getenv("STT_MODEL", "whisper-1").strip()        # transcription
@@ -108,4 +117,4 @@ DUE_REMINDER_DAYS = int(os.getenv("DUE_REMINDER_DAYS", "3"))
 # --- Build marker ---
 # Bumped whenever the bot's behaviour changes, so /version tells you instantly
 # whether the deployment actually picked up the latest code.
-BUILD = os.getenv("BUILD", "2026-07-28.7 smarter-brain").strip()
+BUILD = os.getenv("BUILD", "2026-07-28.8 omniroute").strip()
