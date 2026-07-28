@@ -6,7 +6,10 @@ import io
 import logging
 from datetime import datetime
 
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
+    ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+)
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes,
     MessageHandler, filters
@@ -77,7 +80,8 @@ async def _gate(update: Update) -> bool:
     if text and text.lower() == config.GODFATHER_ANSWER.lower():   # exact secret code
         db.set_verified(uid, update.effective_user.full_name)
         db.reset_failed_code(uid)
-        await update.message.reply_text(WELCOME, disable_web_page_preview=True)
+        await update.message.reply_text(WELCOME, disable_web_page_preview=True,
+                                        reply_markup=_main_keyboard())
     elif text:
         used, banned = db.record_failed_code(
             uid, update.effective_user.full_name, config.MAX_CODE_ATTEMPTS, config.BAN_HOURS)
@@ -183,7 +187,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _gate(update):
         return
     db.get_or_create_user(update.effective_user.id, update.effective_user.full_name)
-    await update.message.reply_text(WELCOME, parse_mode="Markdown")
+    await update.message.reply_text(WELCOME, disable_web_page_preview=True,
+                                    reply_markup=_main_keyboard())
 
 
 async def whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -193,7 +198,8 @@ async def whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _gate(update):
         return
-    await update.message.reply_text(WELCOME, disable_web_page_preview=True)
+    await update.message.reply_text(WELCOME, disable_web_page_preview=True,
+                                    reply_markup=_main_keyboard())
 
 
 def _setup_guide(redirect: str) -> str:
@@ -272,6 +278,90 @@ async def _send_add_flow(chat_id: int, uid: int, ctx: ContextTypes.DEFAULT_TYPE)
             pass
     await ctx.bot.send_message(chat_id, _setup_guide(config.OAUTH_REDIRECT_URI),
                               disable_web_page_preview=True)
+
+
+# --- Persistent bottom menu (the ☰ Menu next to the message box) -----------
+# Tapping a key sends its text, which _menu_action below answers instantly —
+# no AI round-trip, so the common things are one tap and immediate.
+MENU_ROWS = [
+    ["👉 What now", "🌳 My plan"],
+    ["📋 Pending", "✔️ Tick off"],
+    ["🔁 Habits", "⏰ Reminders"],
+    ["💰 Summary", "🧾 My sheets"],
+    ["⚙️ Setup", "❓ Help"],
+]
+
+
+def _main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(b) for b in row] for row in MENU_ROWS],
+        resize_keyboard=True, is_persistent=True,
+        input_field_placeholder="Ask me anything…",
+    )
+
+
+async def menu_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _gate(update):
+        return
+    await update.message.reply_text(
+        "Menu is on — it stays above your keyboard. You can still just type normally.",
+        reply_markup=_main_keyboard())
+
+
+async def hide_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _gate(update):
+        return
+    await update.message.reply_text("Menu hidden. Send /menu to bring it back.",
+                                    reply_markup=ReplyKeyboardRemove())
+
+
+async def _menu_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                       uid: int, text: str) -> bool:
+    """Answer a menu tap directly. Returns True if it was a menu button."""
+    t = text.strip()
+    if t == "👉 What now":
+        await update.message.reply_text(await asyncio.to_thread(tools.what_now, uid))
+    elif t == "🌳 My plan":
+        body = await asyncio.to_thread(tools.show_plan, uid)
+        await update.message.reply_text(body[:3900])
+    elif t == "📋 Pending":
+        await update.message.reply_text(await asyncio.to_thread(tools.list_open_tasks, uid, "all"),
+                                        reply_markup=_tasks_keyboard(uid))
+    elif t == "✔️ Tick off":
+        rows = db.list_tasks(uid, "open", limit=10)
+        if not rows:
+            await update.message.reply_text("No open tasks. 🎉")
+        else:
+            kb = [[InlineKeyboardButton(f"✔️ {x.title[:45]}", callback_data=f"tdone:{x.id}")]
+                  for x in rows]
+            await update.message.reply_text("Which one is done?",
+                                            reply_markup=InlineKeyboardMarkup(kb))
+    elif t == "🔁 Habits":
+        hs = db.habits(uid)
+        if not hs:
+            await update.message.reply_text(
+                "No habits yet. Tell me things like \"remind me to work out 4x a week\".")
+        else:
+            kb = [[InlineKeyboardButton(f"🔁 {h.title[:40]}" + (f" 🔥{h.streak}" if h.streak else ""),
+                                        callback_data=f"hdone:{h.id}")] for h in hs]
+            await update.message.reply_text("Tick off today:",
+                                            reply_markup=InlineKeyboardMarkup(kb))
+    elif t == "⏰ Reminders":
+        await update.message.reply_text(await asyncio.to_thread(tools.list_reminders, uid))
+    elif t == "💰 Summary":
+        await update.message.reply_text(await asyncio.to_thread(tools.get_summary, uid, 30))
+    elif t == "🧾 My sheets":
+        await update.message.reply_text(await asyncio.to_thread(tools.list_sheets, uid),
+                                        reply_markup=_sheets_keyboard(uid))
+    elif t == "⚙️ Setup":
+        await update.message.reply_text(await asyncio.to_thread(tools.sheet_setup_help, uid),
+                                        reply_markup=_accounts_keyboard(uid))
+    elif t == "❓ Help":
+        await update.message.reply_text(WELCOME, disable_web_page_preview=True,
+                                        reply_markup=_main_keyboard())
+    else:
+        return False
+    return True
 
 
 def _tasks_keyboard(uid: int) -> InlineKeyboardMarkup:
@@ -573,6 +663,11 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return await _apply_custom_key(update, ctx, uid, text)
 
     db.get_or_create_user(uid, update.effective_user.full_name)
+
+    # A tap on the bottom menu is answered directly — instant, no AI call.
+    if await _menu_action(update, ctx, uid, text):
+        return
+
     await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     # Persistent, per-user context (isolated by telegram_id, survives restarts).
@@ -867,6 +962,7 @@ async def _post_init(app: Application) -> None:
         BotCommand("start", "What I can do"),
         BotCommand("help", "Show all commands and examples"),
         BotCommand("connect", "Connect a Sheet or your Google account"),
+        BotCommand("menu", "Show the button menu"),
         BotCommand("tasks", "Your task list — pending, today, tick off"),
         BotCommand("sheets", "See or switch your connected Sheets"),
         BotCommand("accounts", "Switch or add Google accounts"),
@@ -892,6 +988,8 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("accounts", accounts))
     app.add_handler(CommandHandler("sheets", sheets_cmd))
     app.add_handler(CommandHandler("tasks", tasks_cmd))
+    app.add_handler(CommandHandler("menu", menu_cmd))
+    app.add_handler(CommandHandler("hidemenu", hide_menu))
     app.add_handler(CommandHandler("addmail", addmail))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("version", version))
