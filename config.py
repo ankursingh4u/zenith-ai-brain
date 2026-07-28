@@ -22,7 +22,15 @@ TELEGRAM_BOT_TOKEN = _required("TELEGRAM_BOT_TOKEN")
 
 # --- OpenAI ---
 OPENAI_API_KEY = _required("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+# The reasoning brain — conversation, planning, code, advice. Worth the money:
+# this is the single biggest lever on how smart the bot feels.
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o").strip()
+# Tried in order if OPENAI_MODEL isn't available on this account, so a model
+# name the key can't use degrades instead of breaking every reply.
+MODEL_FALLBACKS = [m.strip() for m in os.getenv(
+    "MODEL_FALLBACKS", "gpt-4o,gpt-4o-mini").split(",") if m.strip()]
+# Narrow, high-volume jobs (reading a receipt, picking a tab) — cheap is fine.
+FAST_MODEL = os.getenv("FAST_MODEL", "gpt-4o-mini").strip()
 
 # --- Voice (speech-to-text + text-to-speech) ---
 STT_MODEL = os.getenv("STT_MODEL", "whisper-1").strip()        # transcription
@@ -100,4 +108,4 @@ DUE_REMINDER_DAYS = int(os.getenv("DUE_REMINDER_DAYS", "3"))
 # --- Build marker ---
 # Bumped whenever the bot's behaviour changes, so /version tells you instantly
 # whether the deployment actually picked up the latest code.
-BUILD = os.getenv("BUILD", "2026-07-28.6 bottom-menu").strip()
+BUILD = os.getenv("BUILD", "2026-07-28.7 smarter-brain").strip()

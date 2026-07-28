@@ -327,6 +327,18 @@ def update_task(telegram_id: int, task_id: int, title: str | None = None,
     return "✏️ Updated:\n" + _task_line(t)
 
 
+def recall(telegram_id: int, about: str, limit: int = 12) -> str:
+    """Search this user's own past messages — memory beyond the recent window."""
+    rows = db.search_turns(telegram_id, about, max(1, min(int(limit or 12), 25)))
+    if not rows:
+        return f"Nothing in our history about '{about}'."
+    out = []
+    for r in rows:
+        who = "You" if r["role"] == "user" else "Me"
+        out.append(f"[{r['when']}] {who}: {r['content'][:300]}")
+    return f"From our earlier chats about '{about}':\n" + "\n".join(out)
+
+
 def remember_about_me(telegram_id: int, fact: str, replace: bool = False) -> str:
     """Save something durable about who this user is, so it survives the conversation."""
     fact = (fact or "").strip()
@@ -929,6 +941,7 @@ TOOLS: dict[str, callable] = {
     "list_bill_accounts": list_bill_accounts,
     "add_tasks": add_tasks,
     "add_plan": add_plan,
+    "recall": recall,
     "remember_about_me": remember_about_me,
     "my_profile": my_profile,
     "forget_about_me": forget_about_me,
@@ -1007,6 +1020,10 @@ SCHEMAS: list[dict] = [
                        "due_iso": {"type": "string", "description": "Local ISO datetime if they gave a deadline, e.g. 2026-07-31T18:00:00. Omit if none."},
                    }, "required": ["title"]}}},
         ["tasks"]),
+    _fn("recall", "Search the user's OWN past messages for something said earlier — a decision, a number, a name, a promise. Use it whenever they refer to something from before that isn't in the visible conversation ('what did I say about', 'that thing last week', 'the price we agreed').",
+        {"about": {"type": "string", "description": "Word or phrase to look for."},
+         "limit": {"type": "integer", "description": "How many hits. Default 12."}},
+        ["about"]),
     _fn("remember_about_me", "Save a durable fact about WHO THIS USER IS — their job/field, what they're building, what they're training for, a constraint (shift hours, exam date, kids), a strong preference. Call this whenever they reveal something lasting, so you fit them in future chats. Not for one-off details.",
         {"fact": {"type": "string", "description": "One short line, e.g. 'Runs a hardware shop in Ajmer' or 'Training for a marathon in Nov'."},
          "replace": {"type": "boolean", "description": "True to replace the whole profile. Default false (append)."}},

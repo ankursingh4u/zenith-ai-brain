@@ -1154,6 +1154,24 @@ def save_turn(telegram_id: int, role: str, content: str) -> None:
         s.commit()
 
 
+def search_turns(telegram_id: int, needle: str, limit: int = 12) -> list[dict]:
+    """Find past messages containing `needle` — recall beyond the recent window."""
+    needle = (needle or "").strip()
+    if not needle:
+        return []
+    with session() as s:
+        rows = s.scalars(
+            select(ConversationTurn)
+            .where(ConversationTurn.telegram_id == telegram_id,
+                   ConversationTurn.content.ilike(f"%{needle}%"))
+            .order_by(ConversationTurn.id.desc())
+            .limit(limit)
+        ).all()
+    return [{"role": r.role, "content": r.content,
+             "when": r.created_at.strftime("%d %b %H:%M") if r.created_at else ""}
+            for r in reversed(rows)]
+
+
 def recent_turns(telegram_id: int, limit: int = 12) -> list[dict]:
     """Last `limit` turns for this user, oldest-first, as [{'role','content'}]."""
     with session() as s:

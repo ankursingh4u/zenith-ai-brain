@@ -58,7 +58,7 @@ def read_for_columns(
     )
     b64 = base64.b64encode(image_bytes).decode()
     resp = _client.chat.completions.create(
-        model=config.OPENAI_MODEL,
+        model=config.FAST_MODEL,
         messages=[{
             "role": "user",
             "content": [
@@ -87,7 +87,7 @@ def read_bill(image_bytes: bytes, mime: str = "image/jpeg") -> dict:
     """Return {merchant, amount, kind, category, date, note}. amount=0 if unreadable."""
     b64 = base64.b64encode(image_bytes).decode()
     resp = _client.chat.completions.create(
-        model=config.OPENAI_MODEL,           # gpt-4o-mini supports vision
+        model=config.FAST_MODEL,             # narrow extraction — cheap is fine
         messages=[{
             "role": "user",
             "content": [

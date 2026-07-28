@@ -45,7 +45,7 @@ def choose_tab(tabs: dict[str, list[str]], caption: str, facts: dict) -> tuple[s
     detail = ", ".join(f"{k}={v}" for k, v in facts.items() if v not in (None, ""))
     try:
         resp = _client.chat.completions.create(
-            model=config.OPENAI_MODEL,
+            model=config.FAST_MODEL,
             messages=[{"role": "user", "content": (
                 f"{_PROMPT}\n\nTABS:\n{layout}\n\n"
                 f"USER WROTE: {caption or '(nothing)'}\n"

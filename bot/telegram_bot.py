@@ -671,7 +671,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     # Persistent, per-user context (isolated by telegram_id, survives restarts).
-    hist = db.recent_turns(uid, limit=12)
+    hist = db.recent_turns(uid, limit=agent.HISTORY_TURNS)
     try:
         reply = await asyncio.to_thread(agent.handle_message, uid, text, hist)
     except Exception as e:  # noqa: BLE001
@@ -707,7 +707,7 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if await _handle_pending(update, ctx, uid, transcript):
         return
 
-    hist = db.recent_turns(uid, limit=12)
+    hist = db.recent_turns(uid, limit=agent.HISTORY_TURNS)
     try:
         reply = await asyncio.to_thread(agent.handle_message, uid, transcript, hist)
     except Exception as e:  # noqa: BLE001

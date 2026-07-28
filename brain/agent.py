@@ -113,8 +113,43 @@ FORMATTING FOR TELEGRAM (a phone chat — follow strictly):
 - Keep lines short for a narrow phone screen. Use emoji sparingly, only to help structure.
 """
 
-# Cap tool-call rounds so a bad loop can't run up the OpenAI bill.
-MAX_ROUNDS = 6
+# Cap tool-call rounds so a bad loop can't run up the OpenAI bill. Generous
+# enough to chain real work: look up the plan, read a sheet, then act on both.
+MAX_ROUNDS = 10
+
+# How much of the conversation it can see. Long enough to follow a real
+# back-and-forth rather than forgetting what was said ten messages ago.
+HISTORY_TURNS = 30
+
+_model_in_use: str | None = None
+
+
+def _complete(**kwargs):
+    """Call the API, falling back down the model list if one isn't available.
+
+    A model name the account can't use would otherwise break every single reply,
+    so we degrade to the next one and remember the choice.
+    """
+    global _model_in_use
+    tried = []
+    for model in ([_model_in_use] if _model_in_use else
+                  [config.OPENAI_MODEL, *config.MODEL_FALLBACKS]):
+        if model in tried:
+            continue
+        tried.append(model)
+        try:
+            resp = _client.chat.completions.create(model=model, **kwargs)
+            if _model_in_use != model:
+                _model_in_use = model
+            return resp
+        except Exception as e:  # noqa: BLE001
+            text = str(e).lower()
+            if not any(k in text for k in
+                       ("model_not_found", "does not exist", "do not have access",
+                        "unsupported model", "invalid model")):
+                raise            # a real error (rate limit, network) — surface it
+            _model_in_use = None  # that model is unusable; try the next one
+    raise RuntimeError(f"No usable OpenAI model. Tried: {', '.join(tried)}")
 
 
 def handle_message(telegram_id: int, text: str, history: list[dict]) -> str:
@@ -147,11 +182,12 @@ def handle_message(telegram_id: int, text: str, history: list[dict]) -> str:
                 {"role": "user", "content": text}]
 
     for _ in range(MAX_ROUNDS):
-        resp = _client.chat.completions.create(
-            model=config.OPENAI_MODEL,
+        resp = _complete(
             messages=messages,
             tools=tools.SCHEMAS,
-            temperature=0,          # deterministic — critical for money accuracy
+            # Low, not zero: money accuracy comes from the tools and the amount
+            # cross-check, while zero makes advice flat and repetitive.
+            temperature=0.3,
         )
         msg = resp.choices[0].message
 
