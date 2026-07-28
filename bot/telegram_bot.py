@@ -16,15 +16,18 @@ import config
 import crypto
 import db
 from bot.auth import is_allowed
-from brain import agent, speech, tools, vision
+from brain import agent, routing, speech, tools, vision
 from integrations import drive, gservice, mailbox, oauth, sheets
 from scheduler.jobs import run_daily_check, start_scheduler
 
 log = logging.getLogger("brain.bot")
 
 WELCOME = (
-    "🧠 Zenith Brain — your personal assistant & accountant.\n"
+    "🧠 Zenith Brain — your second brain: engineering, founder work, money.\n"
     "Just talk to me naturally, no commands needed:\n\n"
+    "💻 Engineering — paste an error, ask for code, design a schema, check an approach\n"
+    "🚀 Founder — pricing, roadmap, scope cuts, investor/customer emails, next steps\n"
+    "🗂 Tasks — dump everything on your mind, I split it and track what's pending\n"
     "💰 Money — \"paid electricity 2400\", \"summary this month\"\n"
     "⏰ Reminders — \"remind me at 5pm to call the bank\"\n"
     "🔐 Passwords — \"save my wifi password\", \"what's my gmail password\"\n"
@@ -34,6 +37,7 @@ WELCOME = (
     "✏️ Fixes — \"undo that\", \"edit last to 2500\"\n\n"
     "⚙️ Commands (or tap the ☰ menu next to the message box):\n"
     "/connect — link a Google Sheet or Google account\n"
+    "/tasks — your task list (pending, today, tick off)\n"
     "/sheets — see or switch your connected Sheets\n"
     "/accounts — switch or add Google accounts (Gmail/Drive/Docs)\n"
     "/addmail — connect an email mailbox (Migadu, Zoho, IMAP)\n"
@@ -662,7 +666,17 @@ async def _photo_with_instruction(
         tabs = await asyncio.to_thread(sheets.list_tabs, uid)
     except Exception as e:  # noqa: BLE001
         return await msg.reply_text(f"⚠️ Couldn't open your sheet: {e}")
-    tab = tab or (tabs[0] if tabs else None)
+    # Not named? Let the router pick from the tab names + their columns. It only
+    # answers when reasonably sure, so an unclear entry still lands in the first tab.
+    chosen_by = "you named it"
+    if not tab and tabs:
+        layout = {t: await asyncio.to_thread(sheets.tab_headers, uid, t) for t in tabs}
+        tab, why = await asyncio.to_thread(routing.choose_tab, layout, caption, parsed)
+        chosen_by = f"my guess — {why}" if tab else ""
+        log.info("photo: tab router -> %r (%s)", tab, why)
+    if not tab:
+        tab = tabs[0] if tabs else None
+        chosen_by = "default tab"
     if not tab:
         return await msg.reply_text("Your sheet has no tabs I can write to.")
     log.info("photo: writing to tab %r of %s (tabs seen: %s)", tab, uid, tabs)
@@ -697,7 +711,10 @@ async def _photo_with_instruction(
             s.commit()
 
     shown = "\n".join(f"• {h}: {fields[h]}" for h in headers if fields.get(h))
-    reply = f"✅ Added to '{used}':\n{shown}"
+    where_note = f" ({chosen_by})" if chosen_by and chosen_by != "you named it" else ""
+    reply = f"✅ Added to '{used}'{where_note}:\n{shown}"
+    if where_note:
+        reply += "\n(Name the tab in your message if you want a different one.)"
     if link:
         reply += f"\n\n📁 Screenshot on Drive ({where}), anyone with the link can view."
     else:

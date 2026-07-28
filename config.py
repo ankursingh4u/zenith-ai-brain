@@ -100,4 +100,4 @@ DUE_REMINDER_DAYS = int(os.getenv("DUE_REMINDER_DAYS", "3"))
 # --- Build marker ---
 # Bumped whenever the bot's behaviour changes, so /version tells you instantly
 # whether the deployment actually picked up the latest code.
-BUILD = os.getenv("BUILD", "2026-07-28.1 tasks+menu").strip()
+BUILD = os.getenv("BUILD", "2026-07-28.2 tab-router+engineer-founder").strip()
