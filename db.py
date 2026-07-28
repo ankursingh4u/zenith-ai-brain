@@ -44,6 +44,10 @@ class User(Base):
     failed_attempts: Mapped[int] = mapped_column(default=0)
     banned_until: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
+    # Who THIS person is, in their own words — work, goals, interests, constraints.
+    # Injected into the prompt so the assistant fits them, not a hardcoded persona.
+    profile: Mapped[Optional[str]] = mapped_column(Text)
+
     # Encrypted Google OAuth token (JSON), set after the user connects Google.
     google_token_enc: Mapped[Optional[str]] = mapped_column(Text)
     google_email: Mapped[Optional[str]] = mapped_column(String(255))
@@ -273,7 +277,8 @@ def _migrate_add_columns() -> None:
                   ("last_done_at", "DATETIME"), ("streak", "INTEGER DEFAULT 0")],
         "users": [("verified", "INTEGER DEFAULT 0"), ("custom_sa_enc", "TEXT"),
                   ("custom_oauth_enc", "TEXT"), ("default_account", "TEXT"),
-                  ("failed_attempts", "INTEGER DEFAULT 0"), ("banned_until", "DATETIME")],
+                  ("failed_attempts", "INTEGER DEFAULT 0"), ("banned_until", "DATETIME"),
+                  ("profile", "TEXT")],
     }
     insp = inspect(_engine)
     with _engine.begin() as conn:
@@ -903,6 +908,20 @@ def users_with_open_tasks() -> list[int]:
     with session() as s:
         return list(s.scalars(select(Task.telegram_id).where(
             Task.status == "open").distinct()).all())
+
+
+def get_profile(telegram_id: int) -> str | None:
+    with session() as s:
+        u = s.get(User, telegram_id)
+        return u.profile if u else None
+
+
+def set_profile(telegram_id: int, text: str | None) -> None:
+    with session() as s:
+        u = s.get(User, telegram_id)
+        if u:
+            u.profile = (text or "").strip() or None
+            s.commit()
 
 
 # --- Plan tree -----------------------------------------------------------

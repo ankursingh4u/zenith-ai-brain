@@ -327,6 +327,48 @@ def update_task(telegram_id: int, task_id: int, title: str | None = None,
     return "✏️ Updated:\n" + _task_line(t)
 
 
+def remember_about_me(telegram_id: int, fact: str, replace: bool = False) -> str:
+    """Save something durable about who this user is, so it survives the conversation."""
+    fact = (fact or "").strip()
+    if not fact:
+        return "Nothing to remember."
+    current = db.get_profile(telegram_id) or ""
+    if replace:
+        new = fact
+    else:
+        lines = [l for l in current.splitlines() if l.strip()]
+        if any(fact.lower() == l.strip("- ").lower() for l in lines):
+            return "Already knew that."
+        lines.append(f"- {fact}")
+        new = "\n".join(lines[-40:])          # keep the profile from growing forever
+    db.set_profile(telegram_id, new)
+    return f"🧠 Noted about you: {fact}"
+
+
+def my_profile(telegram_id: int) -> str:
+    """Show what the assistant knows about this user."""
+    p = db.get_profile(telegram_id)
+    if not p:
+        return ("I don't know anything about you yet. Tell me what you do, what you're "
+                "working towards, and what matters to you — I'll remember it.")
+    return "🧠 What I know about you:\n" + p + "\n\n(Say 'forget that ...' to correct me.)"
+
+
+def forget_about_me(telegram_id: int, fact: str | None = None) -> str:
+    """Drop one remembered line, or the whole profile."""
+    current = db.get_profile(telegram_id) or ""
+    if not current:
+        return "Nothing stored about you."
+    if not fact:
+        db.set_profile(telegram_id, None)
+        return "🧹 Cleared everything I knew about you."
+    kept = [l for l in current.splitlines() if fact.lower() not in l.lower()]
+    if len(kept) == len(current.splitlines()):
+        return f"Nothing matching '{fact}' in your profile."
+    db.set_profile(telegram_id, "\n".join(kept))
+    return f"🧹 Forgot the bit about '{fact}'."
+
+
 def _node_from(telegram_id: int, item: dict, parent_id: int | None,
                track: str | None, idx: int) -> int:
     """Create one plan node and everything under it. Returns how many were made."""
@@ -853,6 +895,9 @@ TOOLS: dict[str, callable] = {
     "list_bill_accounts": list_bill_accounts,
     "add_tasks": add_tasks,
     "add_plan": add_plan,
+    "remember_about_me": remember_about_me,
+    "my_profile": my_profile,
+    "forget_about_me": forget_about_me,
     "show_plan": show_plan,
     "what_now": what_now,
     "log_progress": log_progress,
@@ -928,6 +973,14 @@ SCHEMAS: list[dict] = [
                        "due_iso": {"type": "string", "description": "Local ISO datetime if they gave a deadline, e.g. 2026-07-31T18:00:00. Omit if none."},
                    }, "required": ["title"]}}},
         ["tasks"]),
+    _fn("remember_about_me", "Save a durable fact about WHO THIS USER IS — their job/field, what they're building, what they're training for, a constraint (shift hours, exam date, kids), a strong preference. Call this whenever they reveal something lasting, so you fit them in future chats. Not for one-off details.",
+        {"fact": {"type": "string", "description": "One short line, e.g. 'Runs a hardware shop in Ajmer' or 'Training for a marathon in Nov'."},
+         "replace": {"type": "boolean", "description": "True to replace the whole profile. Default false (append)."}},
+        ["fact"]),
+    _fn("my_profile", "Show what you currently know about this user.", {}),
+    _fn("forget_about_me", "Remove a remembered fact, or clear the profile if no fact is given.",
+        {"fact": {"type": "string", "description": "Words from the line to drop. Omit to clear everything."}}),
+
     _fn("add_plan", "Store a whole STRUCTURED PLAN as a tree. Use when the user gives a roadmap, phases, or a multi-part goal. Build tracks (big areas like DSA / Dev / Life) -> phases -> tasks, and put repeating things (workout, posting, reading) as kind 'habit'.",
         {"plan": {"type": "array", "description": "Top-level tracks. Each may nest children.",
                   "items": {"type": "object", "properties": {
