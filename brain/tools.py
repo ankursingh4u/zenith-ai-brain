@@ -327,6 +327,174 @@ def update_task(telegram_id: int, task_id: int, title: str | None = None,
     return "✏️ Updated:\n" + _task_line(t)
 
 
+def _node_from(telegram_id: int, item: dict, parent_id: int | None,
+               track: str | None, idx: int) -> int:
+    """Create one plan node and everything under it. Returns how many were made."""
+    title = str(item.get("title") or "").strip()
+    if not title:
+        return 0
+    kind = str(item.get("kind") or ("phase" if item.get("children") else "task")).lower()
+    if kind not in ("track", "phase", "task", "habit"):
+        kind = "task"
+    node_id = db.add_node(
+        telegram_id, title, kind, parent_id, track or item.get("track"),
+        item.get("notes"), item.get("gate"), int(item.get("priority") or 2),
+        item.get("target"), item.get("recur"), idx, _due_utc(item.get("due_iso")),
+    )
+    made = 1
+    for i, child in enumerate(item.get("children") or []):
+        made += _node_from(telegram_id, child, node_id,
+                           track or item.get("track"), i)
+    return made
+
+
+def add_plan(telegram_id: int, plan: list) -> str:
+    """Store a whole structured plan as a tree: tracks → phases → tasks/habits."""
+    if isinstance(plan, dict):
+        plan = [plan]
+    if not plan:
+        return "Empty plan."
+    total = 0
+    names = []
+    for i, top in enumerate(plan[:12]):
+        if not isinstance(top, dict):
+            continue
+        top.setdefault("kind", "track")
+        track = top.get("track") or top.get("title")
+        n = _node_from(telegram_id, top, None, track, i)
+        if n:
+            total += n
+            names.append(f"{top.get('title')} ({n - 1} under it)")
+    if not total:
+        return "Nothing in that plan had a title I could use."
+    return ("🌳 Plan saved:\n" + "\n".join(f"• {n}" for n in names)
+            + f"\n\n{total} nodes stored. Ask 'show plan' any time, or 'what now?'.")
+
+
+def _bar(done: int, total: int) -> str:
+    if not total:
+        return ""
+    filled = round(done / total * 10)
+    return f" [{'█' * filled}{'░' * (10 - filled)}] {done}/{total}"
+
+
+def _render(telegram_id: int, node, depth: int, out: list, max_depth: int) -> None:
+    pad = "  " * depth
+    done, total = db.subtree_stats(telegram_id, node.id)
+    mark = {"done": "✅", "dropped": "🗑"}.get(node.status, "▫️")
+    if node.kind == "habit":
+        mark = "🔁"
+    line = f"{pad}{mark} {node.title}"
+    if total:
+        line += _bar(done, total)
+    elif node.target:
+        line += f" ({node.progress or 0}/{node.target})"
+    if node.kind == "habit" and node.streak:
+        line += f" 🔥{node.streak}"
+    out.append(line)
+    if node.gate and depth <= 1:
+        out.append(f"{pad}   gate: {node.gate}")
+    if depth < max_depth:
+        for kid in db.children(telegram_id, node.id):
+            _render(telegram_id, kid, depth + 1, out, max_depth)
+
+
+def show_plan(telegram_id: int, track: str | None = None, depth: int = 2) -> str:
+    """Show the plan tree with progress. `track` zooms into one area."""
+    tops = db.tracks(telegram_id)
+    if not tops:
+        return ("No plan stored yet. Paste or describe your plan and I'll build the tree "
+                "(tracks → phases → tasks), with gates and priorities.")
+    if track:
+        tops = [t for t in tops if track.lower() in (t.title or "").lower()]
+        if not tops:
+            return "No track by that name. Tracks: " + ", ".join(
+                t.title for t in db.tracks(telegram_id))
+    out: list[str] = []
+    for t in tops:
+        _render(telegram_id, t, 0, out, max(1, min(int(depth or 2), 4)))
+        out.append("")
+    return "\n".join(out).strip()
+
+
+def what_now(telegram_id: int) -> str:
+    """The single next thing to do, decided from the plan — not from memory."""
+    now_local = datetime.now(_TZ)
+    now_utc = now_local.astimezone(_UTC).replace(tzinfo=None)
+    lines = []
+
+    overdue = [t for t in db.list_tasks(telegram_id, "open", due_before=now_utc)]
+    if overdue:
+        lines.append("⚠️ Overdue first:\n" + "\n".join(_task_line(t) for t in overdue[:3]))
+
+    pending_habits = []
+    for h in db.habits(telegram_id):
+        last = h.last_done_at
+        if last is None or last.date() < now_utc.date():
+            pending_habits.append(h)
+
+    # The next open item in EACH track, so no area silently stalls.
+    seen: set[str] = set()
+    blocks = []
+    for t in db.open_leaves(telegram_id):
+        key = t.track or "—"
+        if key in seen:
+            continue
+        seen.add(key)
+        parent = db.get_task(telegram_id, t.parent_id) if t.parent_id else None
+        head = f"{key}: {t.title}" if t.track else t.title
+        block = f"👉 {head}"
+        if t.target:
+            block += f"\n   at {t.progress or 0}/{t.target}"
+        gate = t.gate or (parent.gate if parent else None)
+        if gate:
+            block += f"\n   clears when: {gate}"
+        blocks.append(block)
+    if blocks:
+        lines.append("Next up:\n" + "\n".join(blocks))
+
+    if pending_habits:
+        lines.append("🔁 Not done today: "
+                     + ", ".join(f"{h.title}" + (f" 🔥{h.streak}" if h.streak else "")
+                                 for h in pending_habits))
+    if not lines:
+        return "Nothing open. Either you're done, or the plan needs its next phase. 🎉"
+    return "\n\n".join(lines)
+
+
+def log_progress(telegram_id: int, task_id: int | None = None,
+                 title: str | None = None, count: int = 1) -> str:
+    """Record countable progress — 'solved 5 problems', 'did 2 designs'."""
+    if task_id is None and title:
+        matches = db.find_tasks(telegram_id, title)
+        if not matches:
+            return f"No open item matching '{title}'."
+        if len(matches) > 1:
+            return "Which one?\n" + "\n".join(_task_line(t) for t in matches[:8])
+        task_id = matches[0].id
+    if task_id is None:
+        return "Tell me which item — its number or a word from it."
+    t = db.bump_progress(telegram_id, int(task_id), int(count or 1))
+    if t is None:
+        return f"No task #{task_id}."
+    if t.target:
+        left = max(0, t.target - (t.progress or 0))
+        done_note = " — phase cleared! 🎉" if t.status == "done" else f" — {left} to go"
+        return f"📈 {t.title}: {t.progress}/{t.target}{done_note}"
+    return f"📈 {t.title}: {t.progress} logged."
+
+
+def check_habit(telegram_id: int, title: str) -> str:
+    """Tick off a repeating habit (calisthenics, X post, reading) and keep the streak."""
+    matches = [h for h in db.habits(telegram_id) if title.lower() in (h.title or "").lower()]
+    if not matches:
+        names = ", ".join(h.title for h in db.habits(telegram_id)) or "none set up"
+        return f"No habit matching '{title}'. Your habits: {names}."
+    now_utc = datetime.now(_TZ).astimezone(_UTC).replace(tzinfo=None)
+    h = db.touch_habit(telegram_id, matches[0].id, now_utc)
+    return f"🔁 {h.title} done. Streak: {h.streak} 🔥"
+
+
 def drop_task(telegram_id: int, task_id: int) -> str:
     """Remove a task that's no longer needed (not done — just cancelled)."""
     t = db.set_task_status(telegram_id, int(task_id), "dropped")
@@ -684,6 +852,11 @@ TOOLS: dict[str, callable] = {
     "add_bill_account": add_bill_account,
     "list_bill_accounts": list_bill_accounts,
     "add_tasks": add_tasks,
+    "add_plan": add_plan,
+    "show_plan": show_plan,
+    "what_now": what_now,
+    "log_progress": log_progress,
+    "check_habit": check_habit,
     "list_open_tasks": list_open_tasks,
     "complete_task": complete_task,
     "update_task": update_task,
@@ -755,6 +928,32 @@ SCHEMAS: list[dict] = [
                        "due_iso": {"type": "string", "description": "Local ISO datetime if they gave a deadline, e.g. 2026-07-31T18:00:00. Omit if none."},
                    }, "required": ["title"]}}},
         ["tasks"]),
+    _fn("add_plan", "Store a whole STRUCTURED PLAN as a tree. Use when the user gives a roadmap, phases, or a multi-part goal. Build tracks (big areas like DSA / Dev / Life) -> phases -> tasks, and put repeating things (workout, posting, reading) as kind 'habit'.",
+        {"plan": {"type": "array", "description": "Top-level tracks. Each may nest children.",
+                  "items": {"type": "object", "properties": {
+                      "title": {"type": "string"},
+                      "kind": {"type": "string", "enum": ["track", "phase", "task", "habit"]},
+                      "track": {"type": "string", "description": "Area name, inherited by children."},
+                      "notes": {"type": "string", "description": "Resources, stack, rules."},
+                      "gate": {"type": "string", "description": "What proves it's finished, in the user's words."},
+                      "priority": {"type": "integer", "description": "1 urgent, 2 normal, 3 whenever."},
+                      "target": {"type": "integer", "description": "Countable goal, e.g. 45 problems."},
+                      "recur": {"type": "string", "description": "For habits: daily, weekly, 4x_week."},
+                      "due_iso": {"type": "string"},
+                      "children": {"type": "array", "items": {"type": "object"},
+                                   "description": "Nested nodes, same shape."},
+                  }, "required": ["title"]}}},
+        ["plan"]),
+    _fn("show_plan", "Show the stored plan as a tree with progress bars and gates. Use for 'show my plan', 'where am I', 'progress'.",
+        {"track": {"type": "string", "description": "Zoom into one area, e.g. 'DSA'. Omit for all."},
+         "depth": {"type": "integer", "description": "How deep to show. Default 2."}}),
+    _fn("what_now", "Decide the ONE next thing to do from the plan, plus anything overdue and habits not done today. Use for 'what now?', 'I'm free', 'what should I do'.", {}),
+    _fn("log_progress", "Record countable progress on an item, e.g. 'solved 5 problems'. Clears the item automatically when it hits its target.",
+        {"task_id": {"type": "integer"}, "title": {"type": "string", "description": "A word from the item, if no id."},
+         "count": {"type": "integer", "description": "How many to add. Default 1."}}),
+    _fn("check_habit", "Tick off a repeating habit for today (calisthenics, X post, reading) and keep the streak.",
+        {"title": {"type": "string", "description": "A word from the habit's name."}}, ["title"]),
+
     _fn("list_open_tasks", "List the user's open/pending tasks. Use when they ask what's pending, what's left, or what's due.",
         {"when": {"type": "string", "enum": ["all", "today", "overdue"],
                   "description": "'today' = due by tonight, 'overdue' = past due. Default 'all'."}}),

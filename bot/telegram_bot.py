@@ -277,6 +277,9 @@ async def _send_add_flow(chat_id: int, uid: int, ctx: ContextTypes.DEFAULT_TYPE)
 def _tasks_keyboard(uid: int) -> InlineKeyboardMarkup:
     """The task menu. 'Done' rows are added per-task so ticking off is one tap."""
     rows = [[
+        InlineKeyboardButton("👉 What now", callback_data="task:now"),
+        InlineKeyboardButton("🌳 My plan", callback_data="task:plan"),
+    ], [
         InlineKeyboardButton("📋 Pending", callback_data="task:open"),
         InlineKeyboardButton("📅 Today", callback_data="task:today"),
     ], [
@@ -284,6 +287,8 @@ def _tasks_keyboard(uid: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton("✅ Done list", callback_data="task:done"),
     ], [
         InlineKeyboardButton("✔️ Tick one off", callback_data="task:tick"),
+        InlineKeyboardButton("🔁 Habits", callback_data="task:habits"),
+    ], [
         InlineKeyboardButton("⏰ Reminders", callback_data="task:rem"),
     ]]
     return InlineKeyboardMarkup(rows)
@@ -306,7 +311,26 @@ async def tasks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _task_callback(q, uid: int, data: str, chat_id: int, ctx) -> None:
     """Handle the task menu taps."""
-    if data == "task:open":
+    if data == "task:now":
+        await ctx.bot.send_message(chat_id, tools.what_now(uid),
+                                   reply_markup=_tasks_keyboard(uid))
+    elif data == "task:plan":
+        await ctx.bot.send_message(chat_id, tools.show_plan(uid)[:3900],
+                                   reply_markup=_tasks_keyboard(uid))
+    elif data == "task:habits":
+        hs = db.habits(uid)
+        if not hs:
+            return await ctx.bot.send_message(chat_id, "No habits set up yet.")
+        kb = [[InlineKeyboardButton(f"🔁 {h.title[:40]}" + (f" 🔥{h.streak}" if h.streak else ""),
+                                    callback_data=f"hdone:{h.id}")] for h in hs]
+        await ctx.bot.send_message(chat_id, "Tick off today:",
+                                   reply_markup=InlineKeyboardMarkup(kb))
+    elif data.startswith("hdone:"):
+        h = db.get_task(uid, int(data[6:]))
+        await ctx.bot.send_message(chat_id,
+                                   tools.check_habit(uid, h.title) if h else "Gone.",
+                                   reply_markup=_tasks_keyboard(uid))
+    elif data == "task:open":
         await ctx.bot.send_message(chat_id, tools.list_open_tasks(uid, "all"),
                                    reply_markup=_tasks_keyboard(uid))
     elif data == "task:today":
@@ -345,7 +369,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     data = q.data or ""
     chat_id = q.message.chat_id
 
-    if data.startswith("task:") or data.startswith("tdone:"):
+    if data.startswith(("task:", "tdone:", "hdone:")):
         return await _task_callback(q, uid, data, chat_id, ctx)
 
     if data in ("conn:add", "conn:guide"):

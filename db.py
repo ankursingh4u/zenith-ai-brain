@@ -173,6 +173,23 @@ class Task(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     done_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
+    # --- Plan structure: a task can hold other tasks, so a whole roadmap fits here.
+    parent_id: Mapped[Optional[int]] = mapped_column(index=True)
+    # track = the big area (dsa, dev, life...), phase = a stage inside it,
+    # task = a single job, habit = something that repeats.
+    kind: Mapped[str] = mapped_column(String(10), default="task", index=True)
+    track: Mapped[Optional[str]] = mapped_column(String(40), index=True)
+    order_idx: Mapped[int] = mapped_column(default=0)
+    # What actually counts as finished — the phase's gate, in the user's words.
+    gate: Mapped[Optional[str]] = mapped_column(Text)
+    # Countable work: 12 of 45 problems solved.
+    target: Mapped[Optional[int]] = mapped_column()
+    progress: Mapped[int] = mapped_column(default=0)
+    # Habits: "daily" / "weekly" / "4x_week", with a streak.
+    recur: Mapped[Optional[str]] = mapped_column(String(16))
+    last_done_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    streak: Mapped[int] = mapped_column(default=0)
+
 
 class ConversationTurn(Base):
     """One message in a user's chat history, kept so context survives restarts.
@@ -249,6 +266,11 @@ def _migrate_add_columns() -> None:
     from sqlalchemy import inspect, text
     wanted = {
         "transactions": [("raw_text", "TEXT")],
+        "tasks": [("parent_id", "INTEGER"), ("kind", "VARCHAR(10) DEFAULT 'task'"),
+                  ("track", "VARCHAR(40)"), ("order_idx", "INTEGER DEFAULT 0"),
+                  ("gate", "TEXT"), ("target", "INTEGER"),
+                  ("progress", "INTEGER DEFAULT 0"), ("recur", "VARCHAR(16)"),
+                  ("last_done_at", "DATETIME"), ("streak", "INTEGER DEFAULT 0")],
         "users": [("verified", "INTEGER DEFAULT 0"), ("custom_sa_enc", "TEXT"),
                   ("custom_oauth_enc", "TEXT"), ("default_account", "TEXT"),
                   ("failed_attempts", "INTEGER DEFAULT 0"), ("banned_until", "DATETIME")],
@@ -881,6 +903,127 @@ def users_with_open_tasks() -> list[int]:
     with session() as s:
         return list(s.scalars(select(Task.telegram_id).where(
             Task.status == "open").distinct()).all())
+
+
+# --- Plan tree -----------------------------------------------------------
+def add_node(telegram_id: int, title: str, kind: str = "task",
+             parent_id: int | None = None, track: str | None = None,
+             notes: str | None = None, gate: str | None = None,
+             priority: int = 2, target: int | None = None,
+             recur: str | None = None, order_idx: int = 0,
+             due_at: datetime | None = None) -> int:
+    """One node of a plan. A phase is just a task that holds other tasks."""
+    with session() as s:
+        t = Task(telegram_id=telegram_id, title=title.strip(), kind=kind,
+                 parent_id=parent_id, track=track, notes=notes, gate=gate,
+                 priority=max(1, min(int(priority or 2), 3)), target=target,
+                 recur=recur, order_idx=order_idx, due_at=due_at)
+        s.add(t)
+        s.commit()
+        return t.id
+
+
+def children(telegram_id: int, parent_id: int | None, status: str = "all") -> list["Task"]:
+    with session() as s:
+        stmt = select(Task).where(Task.telegram_id == telegram_id,
+                                  Task.parent_id.is_(None) if parent_id is None
+                                  else Task.parent_id == parent_id)
+        if status != "all":
+            stmt = stmt.where(Task.status == status)
+        rows = s.scalars(stmt.order_by(Task.order_idx, Task.id)).all()
+        for r in rows:
+            s.expunge(r)
+        return list(rows)
+
+
+def tracks(telegram_id: int) -> list["Task"]:
+    """Top-level nodes — the big areas of the plan."""
+    return children(telegram_id, None)
+
+
+def subtree_stats(telegram_id: int, node_id: int) -> tuple[int, int]:
+    """(done_leaves, total_leaves) beneath a node — how far a phase really is."""
+    kids = children(telegram_id, node_id)
+    if not kids:
+        return (0, 0)
+    done = total = 0
+    for k in kids:
+        if k.status == "dropped":
+            continue
+        d, t = subtree_stats(telegram_id, k.id)
+        if t == 0:                       # a leaf
+            total += 1
+            done += 1 if k.status == "done" else 0
+        else:
+            done += d
+            total += t
+    return done, total
+
+
+def bump_progress(telegram_id: int, task_id: int, by: int = 1) -> "Task | None":
+    with session() as s:
+        t = s.get(Task, task_id)
+        if t is None or t.telegram_id != telegram_id:   # ownership check
+            return None
+        t.progress = max(0, (t.progress or 0) + by)
+        if t.target and t.progress >= t.target and t.status == "open":
+            t.status = "done"
+            t.done_at = datetime.utcnow()
+        s.commit()
+        s.refresh(t)
+        s.expunge(t)
+        return t
+
+
+def touch_habit(telegram_id: int, task_id: int, today_utc: datetime) -> "Task | None":
+    """Check a habit off for today and keep the streak honest."""
+    with session() as s:
+        t = s.get(Task, task_id)
+        if t is None or t.telegram_id != telegram_id:   # ownership check
+            return None
+        last = t.last_done_at
+        gap = (today_utc.date() - last.date()).days if last else None
+        if gap == 0:                     # already done today — no double count
+            s.expunge(t)
+            return t
+        t.streak = (t.streak or 0) + 1 if gap is not None and gap <= 2 else 1
+        t.last_done_at = today_utc
+        t.progress = (t.progress or 0) + 1
+        s.commit()
+        s.refresh(t)
+        s.expunge(t)
+        return t
+
+
+def habits(telegram_id: int) -> list["Task"]:
+    with session() as s:
+        rows = s.scalars(select(Task).where(
+            Task.telegram_id == telegram_id, Task.kind == "habit",
+            Task.status == "open").order_by(Task.order_idx, Task.id)).all()
+        for r in rows:
+            s.expunge(r)
+        return list(rows)
+
+
+def open_leaves(telegram_id: int, track: str | None = None, limit: int = 200) -> list["Task"]:
+    """Open, actionable items in plan order.
+
+    A leaf is anything with no children — including a phase that is itself the
+    work (e.g. "P1 Arrays — 45 problems"). Tracks and habits are never leaves.
+    """
+    with session() as s:
+        stmt = select(Task).where(Task.telegram_id == telegram_id,
+                                  Task.status == "open",
+                                  Task.kind.notin_(("track", "habit")))
+        if track:
+            stmt = stmt.where(Task.track == track)
+        rows = list(s.scalars(stmt.order_by(Task.order_idx, Task.id)).all())
+        parents = {r.parent_id for r in s.scalars(select(Task).where(
+            Task.telegram_id == telegram_id, Task.parent_id.is_not(None))).all()}
+        leaves = [r for r in rows if r.id not in parents][:limit]
+        for r in leaves:
+            s.expunge(r)
+        return leaves
 
 
 def add_reminder(telegram_id: int, text: str, due_at: datetime) -> int:
