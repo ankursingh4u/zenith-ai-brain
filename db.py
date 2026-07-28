@@ -1064,6 +1064,17 @@ def delete_subtree(telegram_id: int, node_id: int) -> int:
     return gone
 
 
+def delete_all_reminders(telegram_id: int) -> int:
+    """Drop every reminder for this user (their own rows only)."""
+    with session() as s:
+        rows = s.scalars(select(Reminder).where(Reminder.telegram_id == telegram_id)).all()
+        n = len(rows)
+        for r in rows:
+            s.delete(r)
+        s.commit()
+        return n
+
+
 def delete_all_tasks(telegram_id: int) -> int:
     """Wipe this user's whole plan/task list. Only ever their own rows."""
     with session() as s:

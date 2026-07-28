@@ -445,6 +445,55 @@ def _node_from(telegram_id: int, item: dict, parent_id: int | None,
     return made
 
 
+def disconnect_sheet(telegram_id: int, name: str | None = None) -> str:
+    """Unlink a connected Google Sheet (the sheet itself is never touched)."""
+    rows = db.list_sheets(telegram_id)
+    if not rows:
+        return "No sheets connected."
+    targets = rows if not name else [
+        r for r in rows if name.lower() in (r.title or "").lower()]
+    if not targets:
+        return ("No connected sheet matches that. You have: "
+                + ", ".join(r.title or "Sheet" for r in rows))
+    gone = [r.title or "Sheet" for r in targets if db.remove_sheet(telegram_id, r.sheet_id)]
+    left = db.list_sheets(telegram_id)
+    return (f"🔌 Disconnected: {', '.join(gone)}. "
+            + (f"Still connected: {', '.join(r.title or 'Sheet' for r in left)}."
+               if left else "No sheets connected now.")
+            + "\n(The Google Sheet itself is untouched — I only removed the link.)")
+
+
+def clear_reminders(telegram_id: int) -> str:
+    """Delete every reminder, including repeating ones."""
+    n = db.delete_all_reminders(telegram_id)
+    return f"🗑 Cleared {n} reminder(s)." if n else "No reminders to clear."
+
+
+def reset_everything(telegram_id: int, confirm: bool = False) -> str:
+    """Wipe this user's plan, tasks, reminders, profile and sheet links.
+
+    Destructive and irreversible, so it refuses unless `confirm` is true — the
+    assistant must ask the user first and only pass true once they've said yes.
+    """
+    if not confirm:
+        counts = (f"{db.count_open_tasks(telegram_id)} open task(s), "
+                  f"{len(db.list_reminders(telegram_id))} reminder(s), "
+                  f"{db.count_sheets(telegram_id)} sheet link(s)")
+        return ("⚠️ NOT done yet — this wipes your whole plan, tasks, reminders, "
+                f"profile and sheet links ({counts}). It cannot be undone. "
+                "Ask the user to confirm, then call this again with confirm=true.")
+    tasks = db.delete_all_tasks(telegram_id)
+    rem = db.delete_all_reminders(telegram_id)
+    sheets_n = 0
+    for r in db.list_sheets(telegram_id):
+        if db.remove_sheet(telegram_id, r.sheet_id):
+            sheets_n += 1
+    db.set_profile(telegram_id, None)
+    return (f"🧹 Fresh start: removed {tasks} plan/task item(s), {rem} reminder(s), "
+            f"{sheets_n} sheet link(s), and cleared what I knew about you.\n"
+            "Your Google Sheets and Drive files themselves are untouched.")
+
+
 def clear_plan(telegram_id: int, track: str | None = None) -> str:
     """Delete a whole track (with everything under it), or the entire plan."""
     if track:
@@ -1010,6 +1059,9 @@ TOOLS: dict[str, callable] = {
     "add_tasks": add_tasks,
     "add_plan": add_plan,
     "clear_plan": clear_plan,
+    "disconnect_sheet": disconnect_sheet,
+    "clear_reminders": clear_reminders,
+    "reset_everything": reset_everything,
     "recall": recall,
     "remember_about_me": remember_about_me,
     "my_profile": my_profile,
@@ -1118,6 +1170,11 @@ SCHEMAS: list[dict] = [
                   }, "required": ["title"]}},
          "replace": {"type": "boolean", "description": "TRUE when the user is redoing/correcting their plan — wipes the old one first so tracks don't stack up. Default false."}},
         ["plan"]),
+    _fn("disconnect_sheet", "Unlink a connected Google Sheet from the bot. The spreadsheet itself is NOT deleted — only the link.",
+        {"name": {"type": "string", "description": "Part of the sheet's title. Omit to disconnect ALL of them."}}),
+    _fn("clear_reminders", "Delete all of the user's reminders, including repeating ones.", {}),
+    _fn("reset_everything", "Fresh start: wipe the user's plan, tasks, reminders, profile and sheet links. ALWAYS call it first without confirm to show what will go, get the user's yes, then call again with confirm=true.",
+        {"confirm": {"type": "boolean", "description": "Only true after the user has explicitly agreed."}}),
     _fn("clear_plan", "Delete a track and everything under it, or the whole plan. Use when the user says remove/delete/clear/start over with their plan. This is their own local data — deleting it is allowed.",
         {"track": {"type": "string", "description": "Track name to remove, e.g. 'Life'. Omit to clear the ENTIRE plan."}}),
     _fn("show_plan", "Show the stored plan as a tree with progress bars and gates. Use for 'show my plan', 'where am I', 'progress'.",
