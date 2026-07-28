@@ -156,6 +156,9 @@ class Reminder(Base):
     due_at: Mapped[datetime] = mapped_column(DateTime, index=True, nullable=False)  # UTC
     fired: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # None = one-off. Otherwise it re-arms itself after firing:
+    # daily | weekdays | weekends | weekly
+    repeat: Mapped[Optional[str]] = mapped_column(String(12))
 
 
 class Task(Base):
@@ -270,6 +273,7 @@ def _migrate_add_columns() -> None:
     from sqlalchemy import inspect, text
     wanted = {
         "transactions": [("raw_text", "TEXT")],
+        "reminders": [("repeat", "VARCHAR(12)")],
         "tasks": [("parent_id", "INTEGER"), ("kind", "VARCHAR(10) DEFAULT 'task'"),
                   ("track", "VARCHAR(40)"), ("order_idx", "INTEGER DEFAULT 0"),
                   ("gate", "TEXT"), ("target", "INTEGER"),
@@ -1077,9 +1081,10 @@ def find_tracks(telegram_id: int, name: str) -> list["Task"]:
     return [t for t in tracks(telegram_id) if n and n in (t.title or "").lower()]
 
 
-def add_reminder(telegram_id: int, text: str, due_at: datetime) -> int:
+def add_reminder(telegram_id: int, text: str, due_at: datetime,
+                 repeat: str | None = None) -> int:
     with session() as s:
-        r = Reminder(telegram_id=telegram_id, text=text, due_at=due_at)
+        r = Reminder(telegram_id=telegram_id, text=text, due_at=due_at, repeat=repeat)
         s.add(r)
         s.commit()
         return r.id
@@ -1119,12 +1124,36 @@ def due_reminders(now_utc: datetime) -> list[Reminder]:
         return list(rows)
 
 
+def _next_occurrence(due: datetime, repeat: str) -> datetime:
+    """Next time this repeating reminder should fire, keeping the time of day."""
+    from datetime import timedelta
+    nxt = due + timedelta(weeks=1) if repeat == "weekly" else due + timedelta(days=1)
+    if repeat == "weekdays":
+        while nxt.weekday() >= 5:            # skip Sat/Sun
+            nxt += timedelta(days=1)
+    elif repeat == "weekends":
+        while nxt.weekday() < 5:
+            nxt += timedelta(days=1)
+    return nxt
+
+
 def mark_reminder_fired(reminder_id: int) -> None:
+    """One-off reminders are done; repeating ones re-arm for their next slot."""
+    from datetime import timedelta
     with session() as s:
         r = s.get(Reminder, reminder_id)
-        if r:
+        if not r:
+            return
+        if r.repeat:
+            nxt = _next_occurrence(r.due_at, r.repeat)
+            now = datetime.utcnow()
+            while nxt <= now:                # catch up after downtime
+                nxt = _next_occurrence(nxt, r.repeat)
+            r.due_at = nxt
+            r.fired = False
+        else:
             r.fired = True
-            s.commit()
+        s.commit()
 
 
 # --- Secret (vault) helpers ----------------------------------------------

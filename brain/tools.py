@@ -199,14 +199,38 @@ def list_bill_accounts(telegram_id: int) -> str:
 # =========================================================================
 #  Reminders / tasks
 # =========================================================================
-def set_reminder(telegram_id: int, text: str, when_iso: str) -> str:
-    """when_iso is a local-time ISO datetime, e.g. 2026-07-21T17:00:00."""
+_REPEATS = {"daily", "weekdays", "weekends", "weekly"}
+
+
+def set_reminder(telegram_id: int, text: str, when_iso: str,
+                 repeat: str | None = None) -> str:
+    """when_iso is a local-time ISO datetime. `repeat` makes it recur."""
     local = datetime.fromisoformat(when_iso)
     if local.tzinfo is None:
         local = local.replace(tzinfo=_TZ)
+    repeat = (repeat or "").strip().lower() or None
+    if repeat and repeat not in _REPEATS:
+        repeat = "daily" if "day" in repeat else "weekly"
+    # A recurring reminder given a past time means "start from the next one".
+    if repeat:
+        from datetime import timedelta
+        step = timedelta(weeks=1) if repeat == "weekly" else timedelta(days=1)
+        while local <= datetime.now(_TZ):
+            local += step
+        if repeat == "weekdays":
+            while local.weekday() >= 5:
+                local += timedelta(days=1)
+        elif repeat == "weekends":
+            while local.weekday() < 5:
+                local += timedelta(days=1)
     due_utc = local.astimezone(_UTC).replace(tzinfo=None)   # store naive UTC
-    db.add_reminder(telegram_id, text, due_utc)
-    return f"⏰ Reminder set for {local.astimezone(_TZ):%a %d %b %Y, %H:%M}: {text}"
+    db.add_reminder(telegram_id, text, due_utc, repeat)
+    when = f"every day at {local:%H:%M}" if repeat == "daily" else (
+        f"every weekday at {local:%H:%M}" if repeat == "weekdays" else (
+            f"every weekend day at {local:%H:%M}" if repeat == "weekends" else (
+                f"every {local:%A} at {local:%H:%M}" if repeat == "weekly"
+                else f"{local:%a %d %b %Y, %H:%M}")))
+    return f"⏰ Reminder set for {when}: {text}"
 
 
 def list_reminders(telegram_id: int) -> str:
@@ -216,7 +240,8 @@ def list_reminders(telegram_id: int) -> str:
     lines = []
     for r in rows:
         local = r.due_at.replace(tzinfo=_UTC).astimezone(_TZ)
-        lines.append(f"#{r.id} — {local:%a %d %b, %H:%M}: {r.text}")
+        every = f" 🔁 {r.repeat}" if getattr(r, "repeat", None) else ""
+        lines.append(f"#{r.id} — {local:%a %d %b, %H:%M}{every}: {r.text}")
     return "Pending reminders:\n" + "\n".join(lines)
 
 
@@ -1119,9 +1144,11 @@ SCHEMAS: list[dict] = [
     _fn("drop_task", "Cancel a task that's no longer needed (it wasn't done).",
         {"task_id": {"type": "integer"}}, ["task_id"]),
 
-    _fn("set_reminder", "Set a time-based reminder. Compute the exact local datetime from the user's words using the current time given to you.",
+    _fn("set_reminder", "Set a time-based reminder, one-off or REPEATING. Compute the exact local datetime from the user's words using the current time given to you. For a daily routine (wake-up, gym, study block) always pass repeat.",
         {"text": {"type": "string", "description": "What to remind about."},
-         "when_iso": {"type": "string", "description": "Local ISO datetime, e.g. 2026-07-21T17:00:00."}},
+         "when_iso": {"type": "string", "description": "Local ISO datetime of the FIRST firing, e.g. 2026-07-21T17:00:00."},
+         "repeat": {"type": "string", "enum": ["daily", "weekdays", "weekends", "weekly"],
+                    "description": "Omit for a one-off. 'weekdays' = Mon-Fri."}},
         ["text", "when_iso"]),
     _fn("list_reminders", "List the user's pending reminders.", {}),
     _fn("cancel_reminder", "Cancel a reminder by its id.",
