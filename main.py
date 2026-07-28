@@ -35,6 +35,10 @@ def main() -> None:
     db.init_db()
     log.info("Database ready.")
 
+    log.info("LLM: %s | brain=%s vision=%s fast=%s",
+             config.LLM_BASE_URL or "api.openai.com (default)",
+             config.OPENAI_MODEL, config.VISION_MODEL, config.FAST_MODEL)
+
     if gservice.is_configured():
         log.info("Google service account ready: %s", gservice.service_account_email())
     else:
