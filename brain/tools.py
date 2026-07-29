@@ -576,22 +576,73 @@ def _render(telegram_id: int, node, depth: int, out: list, max_depth: int) -> No
             _render(telegram_id, kid, depth + 1, out, max_depth)
 
 
-def show_plan(telegram_id: int, track: str | None = None, depth: int = 2) -> str:
-    """Show the plan tree with progress. `track` zooms into one area."""
+def _summary_line(telegram_id: int, t) -> str:
+    """One line per track: progress bar + the phase actually in play."""
+    done, total = db.subtree_stats(telegram_id, t.id)
+    bar = _bar(done, total).strip() if total else ""
+    line = f"{t.title} {bar}".rstrip()
+    nxt = next((k for k in db.children(telegram_id, t.id)
+                if k.status == "open" and k.kind != "habit"), None)
+    if nxt:
+        bit = f"\n   → now: {nxt.title}"
+        if nxt.target:
+            bit += f" ({nxt.progress or 0}/{nxt.target})"
+        line += bit
+    return line
+
+
+def show_plan(telegram_id: int, track: str | None = None, full: bool = False) -> str:
+    """The plan. Short by default — a wall of every phase and gate is unreadable
+    on a phone. `track` opens one area, `full` dumps everything."""
     tops = db.tracks(telegram_id)
     if not tops:
-        return ("No plan stored yet. Paste or describe your plan and I'll build the tree "
-                "(tracks → phases → tasks), with gates and priorities.")
+        return ("No plan stored yet. Send me your plan (paste it or attach a file) "
+                "and I'll build the tree — tracks, phases and gates.")
+
+    # One track asked for: its phases, gate only on the one in play.
     if track:
-        tops = [t for t in tops if track.lower() in (t.title or "").lower()]
-        if not tops:
-            return "No track by that name. Tracks: " + ", ".join(
-                t.title for t in db.tracks(telegram_id))
-    out: list[str] = []
+        hits = [t for t in tops if track.lower() in (t.title or "").lower()]
+        if not hits:
+            return "No track by that name. You have: " + ", ".join(t.title for t in tops)
+        out = []
+        for t in hits[:2]:
+            done, total = db.subtree_stats(telegram_id, t.id)
+            out.append(f"🌳 {t.title} {_bar(done, total).strip()}")
+            shown_gate = False
+            for k in db.children(telegram_id, t.id):
+                mark = {"done": "✅", "dropped": "🗑"}.get(k.status, "▫️")
+                if k.kind == "habit":
+                    mark = "🔁"
+                row = f"  {mark} {k.title}"
+                if k.target:
+                    row += f" ({k.progress or 0}/{k.target})"
+                if k.streak:
+                    row += f" 🔥{k.streak}"
+                out.append(row)
+                if k.status == "open" and k.gate and not shown_gate:
+                    out.append(f"       gate: {k.gate}")
+                    shown_gate = True
+            out.append("")
+        return "\n".join(out).strip()[:3800]
+
+    if full:                                   # everything, on explicit request
+        out: list[str] = []
+        for t in tops:
+            _render(telegram_id, t, 0, out, 2)
+            out.append("")
+        return "\n".join(out).strip()[:3800]
+
+    # Default: one block per track, plus habits. Short enough to actually read.
+    out = ["🌳 Your plan"]
     for t in tops:
-        _render(telegram_id, t, 0, out, max(1, min(int(depth or 2), 4)))
-        out.append("")
-    return "\n".join(out).strip()
+        out.append(_summary_line(telegram_id, t))
+    habits = db.habits(telegram_id)
+    if habits:
+        out.append("\n🔁 " + ", ".join(
+            h.title + (f" 🔥{h.streak}" if h.streak else "") for h in habits[:8]))
+    names = ", ".join(t.title for t in tops[:4])
+    out.append(f"\nSay \"show {tops[0].title}\" for its phases, or \"full plan\" for everything.")
+    return "\n".join(out)[:3800]
 
 
 def plan_snapshot(telegram_id: int, max_chars: int = 1200) -> str:
@@ -1177,9 +1228,9 @@ SCHEMAS: list[dict] = [
         {"confirm": {"type": "boolean", "description": "Only true after the user has explicitly agreed."}}),
     _fn("clear_plan", "Delete a track and everything under it, or the whole plan. Use when the user says remove/delete/clear/start over with their plan. This is their own local data — deleting it is allowed.",
         {"track": {"type": "string", "description": "Track name to remove, e.g. 'Life'. Omit to clear the ENTIRE plan."}}),
-    _fn("show_plan", "Show the stored plan as a tree with progress bars and gates. Use for 'show my plan', 'where am I', 'progress'.",
-        {"track": {"type": "string", "description": "Zoom into one area, e.g. 'DSA'. Omit for all."},
-         "depth": {"type": "integer", "description": "How deep to show. Default 2."}}),
+    _fn("show_plan", "Show the plan. SHORT by default — one line per track with progress and the phase in play. Pass track to open one area's phases, or full=true only when the user explicitly asks for the whole thing.",
+        {"track": {"type": "string", "description": "Open one area, e.g. 'DSA'."},
+         "full": {"type": "boolean", "description": "True ONLY if they asked for the full/complete plan. It is long."}}),
     _fn("what_now", "Decide the ONE next thing to do from the plan, plus anything overdue and habits not done today. Use for 'what now?', 'I'm free', 'what should I do'.", {}),
     _fn("log_progress", "Record countable progress on an item, e.g. 'solved 5 problems'. Clears the item automatically when it hits its target.",
         {"task_id": {"type": "integer"}, "title": {"type": "string", "description": "A word from the item, if no id."},
