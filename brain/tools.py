@@ -789,6 +789,145 @@ def delete_password(telegram_id: int, name: str) -> str:
 # =========================================================================
 #  Google sheet / drive: connect & read (share-a-sheet model)
 # =========================================================================
+def list_transactions(telegram_id: int, limit: int = 10) -> str:
+    """Recent money entries with their ids, so any of them can be fixed."""
+    rows = db.list_transactions(telegram_id, max(1, min(int(limit or 10), 30)))
+    if not rows:
+        return "No transactions logged yet."
+    out = []
+    for r in rows:
+        arrow = "in" if r.kind == "in" else "out"
+        when = r.occurred_at.strftime("%d %b") if r.occurred_at else ""
+        out.append(f"#{r.id} - {when} - {r.amount:.2f} {arrow}"
+                   + (f" - {r.category}" if r.category else "")
+                   + (f" ({r.note})" if r.note else ""))
+    return "Recent entries:\n" + "\n".join(out)
+
+
+def edit_transaction(telegram_id: int, transaction_id: int, amount: float | None = None,
+                     kind: str | None = None, category: str | None = None,
+                     note: str | None = None) -> str:
+    """Correct ANY logged entry by its id, not just the most recent one."""
+    if kind is not None:
+        kind = "in" if str(kind).lower() in ("in", "credit", "income", "received") else "out"
+    if amount is not None:
+        amount = abs(float(amount))
+    ok = db.update_transaction(telegram_id, int(transaction_id), amount, kind, category, note)
+    if not ok:
+        return f"No transaction #{transaction_id}."
+    return f"✏️ Updated entry #{transaction_id}."
+
+
+def delete_transaction(telegram_id: int, transaction_id: int) -> str:
+    """Delete any logged entry by id (local record only - the sheet row stays)."""
+    removed = db.delete_transaction(telegram_id, int(transaction_id))
+    if removed is None:
+        return f"No transaction #{transaction_id}."
+    direction = "in" if removed.kind == "in" else "out"
+    return (f"🗑 Deleted #{transaction_id}: {removed.amount:.2f} {direction}.\n"
+            "(The row in your Google Sheet isn't removed - delete it there if needed.)")
+
+
+def edit_reminder(telegram_id: int, reminder_id: int, text: str | None = None,
+                  when_iso: str | None = None, repeat: str | None = None) -> str:
+    """Change a reminder's wording, its time, or how it repeats."""
+    due = None
+    if when_iso:
+        local = datetime.fromisoformat(when_iso)
+        if local.tzinfo is None:
+            local = local.replace(tzinfo=_TZ)
+        due = local.astimezone(_UTC).replace(tzinfo=None)
+    clear = str(repeat).lower() in ("none", "off", "once", "never") if repeat else False
+    r = db.update_reminder(telegram_id, int(reminder_id), text, due,
+                           None if clear else repeat, clear)
+    if r is None:
+        return f"No reminder #{reminder_id}."
+    local = r.due_at.replace(tzinfo=_UTC).astimezone(_TZ)
+    every = f" 🔁 {r.repeat}" if r.repeat else ""
+    return f"✏️ Reminder #{r.id} -> {local:%a %d %b, %H:%M}{every}: {r.text}"
+
+
+def add_habit(telegram_id: int, title: str, recur: str = "daily",
+              notes: str | None = None) -> str:
+    """Start tracking a repeating habit with a streak (gym, posting, reading)."""
+    existing = [h for h in db.habits(telegram_id)
+                if title.lower() in (h.title or "").lower()]
+    if existing:
+        return f"Already tracking '{existing[0].title}'."
+    life = next((t for t in db.tracks(telegram_id)
+                 if (t.title or "").lower() in ("life", "habits")), None)
+    db.add_node(telegram_id, title, "habit", life.id if life else None,
+                life.track if life else "Life", notes, None, 2, None, recur, 0)
+    return f"🔁 Tracking '{title}' ({recur}). Say 'did {title}' to tick it off."
+
+
+def list_habits(telegram_id: int) -> str:
+    """Show habits with their streaks and whether today is done."""
+    hs = db.habits(telegram_id)
+    if not hs:
+        return "No habits tracked yet. Say e.g. 'track calisthenics 4x a week'."
+    today = datetime.now(_TZ).astimezone(_UTC).replace(tzinfo=None).date()
+    out = []
+    for h in hs:
+        done = h.last_done_at is not None and h.last_done_at.date() == today
+        out.append(f"{'✅' if done else '⬜'} {h.title}"
+                   + (f" - {h.recur}" if h.recur else "")
+                   + (f" 🔥{h.streak}" if h.streak else ""))
+    return "Habits:\n" + "\n".join(out)
+
+
+def remove_habit(telegram_id: int, title: str) -> str:
+    """Stop tracking a habit."""
+    hits = [h for h in db.habits(telegram_id) if title.lower() in (h.title or "").lower()]
+    if not hits:
+        return f"No habit matching '{title}'."
+    db.delete_subtree(telegram_id, hits[0].id)
+    return f"🗑 Stopped tracking '{hits[0].title}'."
+
+
+def edit_bill_account(telegram_id: int, name: str, new_name: str | None = None,
+                      due_day: int | None = None, statement_day: int | None = None) -> str:
+    """Change a tracked bill's name or its due/statement day."""
+    acc = db.update_bill(telegram_id, name, new_name, statement_day, due_day)
+    if acc is None:
+        return f"No tracked bill matching '{name}'."
+    return (f"✏️ {acc.name} - due day {acc.due_day or '?'}, "
+            f"statement day {acc.statement_day or '?'}.")
+
+
+def delete_bill_account(telegram_id: int, name: str) -> str:
+    """Stop tracking a bill."""
+    gone = db.delete_bill(telegram_id, name)
+    if not gone:
+        return f"No tracked bill matching '{name}'."
+    return f"🗑 Stopped tracking '{gone}'."
+
+
+def remove_mailbox(telegram_id: int, email: str) -> str:
+    """Disconnect an IMAP/SMTP mailbox."""
+    if db.remove_mail_account(telegram_id, email):
+        return f"🔌 Removed mailbox {email}."
+    return f"No mailbox matching '{email}'."
+
+
+def remove_google_account(telegram_id: int, email: str) -> str:
+    """Unlink a Google account (Gmail/Drive/Calendar access stops)."""
+    if db.remove_google_account(telegram_id, email):
+        return f"🔌 Unlinked {email}."
+    return f"No linked account matching '{email}'."
+
+
+def set_default_google_account(telegram_id: int, email: str) -> str:
+    """Choose which linked Google account is used by default."""
+    accts = db.list_google_accounts(telegram_id)
+    match = [a for a in accts if email.lower() in a.email.lower()]
+    if not match:
+        return "No linked account matches. Linked: " + (
+            ", ".join(a.email for a in accts) or "none")
+    db.set_default_account(telegram_id, match[0].email)
+    return f"⭐ Default account is now {match[0].email}."
+
+
 def sheet_setup_help(telegram_id: int) -> str:
     """Explain how to connect a sheet — the bot's email + the steps."""
     if not gservice.available_for(telegram_id):
@@ -1132,6 +1271,18 @@ TOOLS: dict[str, callable] = {
     "get_password": get_password,
     "list_passwords": list_passwords,
     "delete_password": delete_password,
+    "list_transactions": list_transactions,
+    "edit_transaction": edit_transaction,
+    "delete_transaction": delete_transaction,
+    "edit_reminder": edit_reminder,
+    "add_habit": add_habit,
+    "list_habits": list_habits,
+    "remove_habit": remove_habit,
+    "edit_bill_account": edit_bill_account,
+    "delete_bill_account": delete_bill_account,
+    "remove_mailbox": remove_mailbox,
+    "remove_google_account": remove_google_account,
+    "set_default_google_account": set_default_google_account,
     "sheet_setup_help": sheet_setup_help,
     "register_sheet": register_sheet,
     "register_drive_folder": register_drive_folder,
@@ -1273,6 +1424,33 @@ SCHEMAS: list[dict] = [
     _fn("delete_password", "Delete a saved credential by name.",
         {"name": {"type": "string"}}, ["name"]),
 
+    _fn("list_transactions", "List recent money entries WITH their id numbers, so a specific one can be corrected or deleted.",
+        {"limit": {"type": "integer", "description": "How many. Default 10."}}),
+    _fn("edit_transaction", "Correct ANY logged entry by its id (not just the last one).",
+        {"transaction_id": {"type": "integer"}, "amount": {"type": "number"},
+         "kind": {"type": "string", "enum": ["in", "out"]},
+         "category": {"type": "string"}, "note": {"type": "string"}}, ["transaction_id"]),
+    _fn("delete_transaction", "Delete a logged entry by id from the local record.",
+        {"transaction_id": {"type": "integer"}}, ["transaction_id"]),
+    _fn("edit_reminder", "Change a reminder: its wording, its time, or how it repeats. Pass repeat='none' to stop it repeating.",
+        {"reminder_id": {"type": "integer"}, "text": {"type": "string"},
+         "when_iso": {"type": "string", "description": "New local ISO datetime."},
+         "repeat": {"type": "string", "description": "daily | weekdays | weekends | weekly | none"}},
+        ["reminder_id"]),
+    _fn("add_habit", "Start tracking a repeating habit with a streak (gym, posting, reading).",
+        {"title": {"type": "string"},
+         "recur": {"type": "string", "description": "daily | weekly | 4x_week. Default daily."},
+         "notes": {"type": "string"}}, ["title"]),
+    _fn("list_habits", "Show habits, their streaks, and whether each is done today.", {}),
+    _fn("remove_habit", "Stop tracking a habit.", {"title": {"type": "string"}}, ["title"]),
+    _fn("edit_bill_account", "Change a tracked bill's name or due/statement day.",
+        {"name": {"type": "string"}, "new_name": {"type": "string"},
+         "due_day": {"type": "integer"}, "statement_day": {"type": "integer"}}, ["name"]),
+    _fn("delete_bill_account", "Stop tracking a bill.", {"name": {"type": "string"}}, ["name"]),
+    _fn("remove_mailbox", "Disconnect an IMAP/SMTP mailbox.", {"email": {"type": "string"}}, ["email"]),
+    _fn("remove_google_account", "Unlink a Google account.", {"email": {"type": "string"}}, ["email"]),
+    _fn("set_default_google_account", "Set which linked Google account is used by default.",
+        {"email": {"type": "string"}}, ["email"]),
     _fn("sheet_setup_help", "Explain how the user connects their Google Sheet/Drive folder (gives the bot's share email + steps). Use when they ask how to connect a sheet.", {}),
     _fn("register_sheet", "Connect a Google Sheet the user has shared with the bot. Use when they send a Google Sheets link.",
         {"sheet_url": {"type": "string", "description": "The Google Sheets URL or id."}}, ["sheet_url"]),

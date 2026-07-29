@@ -687,6 +687,80 @@ def add_account(
         return acc.id
 
 
+def list_transactions(telegram_id: int, limit: int = 15) -> list["Transaction"]:
+    """Most recent transactions first, so they can be listed and corrected by id."""
+    with session() as s:
+        rows = s.scalars(select(Transaction)
+                         .where(Transaction.telegram_id == telegram_id)
+                         .order_by(Transaction.id.desc()).limit(limit)).all()
+        for r in rows:
+            s.expunge(r)
+        return list(rows)
+
+
+def update_reminder(telegram_id: int, reminder_id: int, text: str | None = None,
+                    due_at: datetime | None = None,
+                    repeat: str | None = None, clear_repeat: bool = False):
+    with session() as s:
+        r = s.get(Reminder, reminder_id)
+        if r is None or r.telegram_id != telegram_id:   # ownership check
+            return None
+        if text is not None:
+            r.text = text
+        if due_at is not None:
+            r.due_at = due_at
+            r.fired = False
+        if clear_repeat:
+            r.repeat = None
+        elif repeat is not None:
+            r.repeat = repeat
+        s.commit()
+        s.refresh(r)
+        s.expunge(r)
+        return r
+
+
+def find_bill(telegram_id: int, name: str) -> "Account | None":
+    n = (name or "").strip().lower()
+    for a in list_accounts(telegram_id):
+        if n and n in (a.name or "").lower():
+            return a
+    return None
+
+
+def update_bill(telegram_id: int, name: str, new_name: str | None = None,
+                statement_day: int | None = None, due_day: int | None = None):
+    with session() as s:
+        acc = s.scalars(select(Account).where(
+            Account.telegram_id == telegram_id)).all()
+        target = next((a for a in acc if name.lower() in (a.name or "").lower()), None)
+        if target is None:
+            return None
+        if new_name:
+            target.name = new_name
+        if statement_day is not None:
+            target.statement_day = statement_day
+        if due_day is not None:
+            target.due_day = due_day
+        s.commit()
+        s.refresh(target)
+        s.expunge(target)
+        return target
+
+
+def delete_bill(telegram_id: int, name: str) -> str | None:
+    with session() as s:
+        acc = s.scalars(select(Account).where(
+            Account.telegram_id == telegram_id)).all()
+        target = next((a for a in acc if name.lower() in (a.name or "").lower()), None)
+        if target is None:
+            return None
+        label = target.name
+        s.delete(target)
+        s.commit()
+        return label
+
+
 def list_accounts(telegram_id: int) -> list[Account]:
     with session() as s:
         rows = s.scalars(
