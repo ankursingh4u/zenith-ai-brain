@@ -245,9 +245,14 @@ def list_reminders(telegram_id: int) -> str:
     return "Pending reminders:\n" + "\n".join(lines)
 
 
-def cancel_reminder(telegram_id: int, reminder_id: int) -> str:
-    return "Reminder cancelled." if db.cancel_reminder(telegram_id, reminder_id) \
-        else "No such reminder."
+def cancel_reminder(telegram_id: int, reminder_id: int | None = None,
+                    match: str | None = None) -> str:
+    """Cancel a reminder by id or by words from it."""
+    reminder_id, problem = _pick_reminder(telegram_id, reminder_id, match)
+    if problem:
+        return problem
+    return ("Reminder cancelled." if db.cancel_reminder(telegram_id, reminder_id)
+            else "No such reminder.")
 
 
 # =========================================================================
@@ -789,6 +794,61 @@ def delete_password(telegram_id: int, name: str) -> str:
 # =========================================================================
 #  Google sheet / drive: connect & read (share-a-sheet model)
 # =========================================================================
+def _pick_transaction(telegram_id: int, tx_id, match: str | None):
+    """Find a money entry by id OR by words from its category/note/amount.
+
+    Models often pass a placeholder id of 0 next to the description, so a falsy
+    id counts as absent and a wrong id still falls back to the description.
+    """
+    try:
+        tid = int(tx_id) if tx_id not in (None, "") else None
+    except (TypeError, ValueError):
+        tid = None
+    rows = db.list_transactions(telegram_id, 40)
+    if tid is not None and tid > 0 and any(r.id == tid for r in rows):
+        return tid, None
+    if match:
+        m = str(match).strip().lower()
+        hits = [r for r in rows
+                if m in (r.category or "").lower()
+                or m in (r.note or "").lower()
+                or m in f"{r.amount:.0f}"]
+        if len(hits) == 1:
+            return hits[0].id, None
+        if len(hits) > 1:
+            listing = "\n".join(
+                f"#{r.id} - {r.amount:.2f} {'in' if r.kind == 'in' else 'out'}"
+                + (f" - {r.category}" if r.category else "") for r in hits[:8])
+            return None, "Which one?\n" + listing
+        return None, f"No entry matching '{match}'."
+    if tid is not None and tid > 0:
+        return None, f"No transaction #{tid}."
+    return None, "Which entry? Give its number or a word from it."
+
+
+def _pick_reminder(telegram_id: int, rem_id, match: str | None):
+    """Find a reminder by id OR by words from its text."""
+    try:
+        rid = int(rem_id) if rem_id not in (None, "") else None
+    except (TypeError, ValueError):
+        rid = None
+    rows = db.list_reminders(telegram_id)
+    if rid is not None and rid > 0 and any(r.id == rid for r in rows):
+        return rid, None
+    if match:
+        m = str(match).strip().lower()
+        hits = [r for r in rows if m in (r.text or "").lower()]
+        if len(hits) == 1:
+            return hits[0].id, None
+        if len(hits) > 1:
+            return None, "Which one?\n" + "\n".join(
+                f"#{r.id} - {r.text}" for r in hits[:8])
+        return None, f"No reminder matching '{match}'."
+    if rid is not None and rid > 0:
+        return None, f"No reminder #{rid}."
+    return None, "Which reminder? Give its number or a word from it."
+
+
 def list_transactions(telegram_id: int, limit: int = 10) -> str:
     """Recent money entries with their ids, so any of them can be fixed."""
     rows = db.list_transactions(telegram_id, max(1, min(int(limit or 10), 30)))
@@ -804,10 +864,14 @@ def list_transactions(telegram_id: int, limit: int = 10) -> str:
     return "Recent entries:\n" + "\n".join(out)
 
 
-def edit_transaction(telegram_id: int, transaction_id: int, amount: float | None = None,
-                     kind: str | None = None, category: str | None = None,
-                     note: str | None = None) -> str:
-    """Correct ANY logged entry by its id, not just the most recent one."""
+def edit_transaction(telegram_id: int, transaction_id: int | None = None,
+                     amount: float | None = None, kind: str | None = None,
+                     category: str | None = None, note: str | None = None,
+                     match: str | None = None) -> str:
+    """Correct ANY logged entry, found by id or by how the user described it."""
+    transaction_id, problem = _pick_transaction(telegram_id, transaction_id, match)
+    if problem:
+        return problem
     if kind is not None:
         kind = "in" if str(kind).lower() in ("in", "credit", "income", "received") else "out"
     if amount is not None:
@@ -818,8 +882,12 @@ def edit_transaction(telegram_id: int, transaction_id: int, amount: float | None
     return f"✏️ Updated entry #{transaction_id}."
 
 
-def delete_transaction(telegram_id: int, transaction_id: int) -> str:
-    """Delete any logged entry by id (local record only - the sheet row stays)."""
+def delete_transaction(telegram_id: int, transaction_id: int | None = None,
+                       match: str | None = None) -> str:
+    """Delete a logged entry, found by id or description (local record only)."""
+    transaction_id, problem = _pick_transaction(telegram_id, transaction_id, match)
+    if problem:
+        return problem
     removed = db.delete_transaction(telegram_id, int(transaction_id))
     if removed is None:
         return f"No transaction #{transaction_id}."
@@ -828,9 +896,13 @@ def delete_transaction(telegram_id: int, transaction_id: int) -> str:
             "(The row in your Google Sheet isn't removed - delete it there if needed.)")
 
 
-def edit_reminder(telegram_id: int, reminder_id: int, text: str | None = None,
-                  when_iso: str | None = None, repeat: str | None = None) -> str:
-    """Change a reminder's wording, its time, or how it repeats."""
+def edit_reminder(telegram_id: int, reminder_id: int | None = None,
+                  text: str | None = None, when_iso: str | None = None,
+                  repeat: str | None = None, match: str | None = None) -> str:
+    """Change a reminder, found by id or by words from it."""
+    reminder_id, problem = _pick_reminder(telegram_id, reminder_id, match)
+    if problem:
+        return problem
     due = None
     if when_iso:
         local = datetime.fromisoformat(when_iso)
@@ -1410,8 +1482,9 @@ SCHEMAS: list[dict] = [
                     "description": "Omit for a one-off. 'weekdays' = Mon-Fri."}},
         ["text", "when_iso"]),
     _fn("list_reminders", "List the user's pending reminders.", {}),
-    _fn("cancel_reminder", "Cancel a reminder by its id.",
-        {"reminder_id": {"type": "integer"}}, ["reminder_id"]),
+    _fn("cancel_reminder", "Cancel a reminder, by id OR by words from it (match).",
+        {"reminder_id": {"type": "integer"},
+         "match": {"type": "string", "description": "Words from the reminder, e.g. 'gym'."}}),
 
     _fn("save_password", "Save/update a password or credential in the user's encrypted vault.",
         {"name": {"type": "string", "description": "Label, e.g. 'gmail', 'wifi'."},
@@ -1426,17 +1499,20 @@ SCHEMAS: list[dict] = [
 
     _fn("list_transactions", "List recent money entries WITH their id numbers, so a specific one can be corrected or deleted.",
         {"limit": {"type": "integer", "description": "How many. Default 10."}}),
-    _fn("edit_transaction", "Correct ANY logged entry by its id (not just the last one).",
-        {"transaction_id": {"type": "integer"}, "amount": {"type": "number"},
-         "kind": {"type": "string", "enum": ["in", "out"]},
-         "category": {"type": "string"}, "note": {"type": "string"}}, ["transaction_id"]),
-    _fn("delete_transaction", "Delete a logged entry by id from the local record.",
-        {"transaction_id": {"type": "integer"}}, ["transaction_id"]),
-    _fn("edit_reminder", "Change a reminder: its wording, its time, or how it repeats. Pass repeat='none' to stop it repeating.",
-        {"reminder_id": {"type": "integer"}, "text": {"type": "string"},
+    _fn("edit_transaction", "Correct ANY logged entry. Identify it by id OR by how the user described it (match), e.g. 'the electricity one'. Don't ask for a number you can work out yourself.",
+        {"transaction_id": {"type": "integer", "description": "Its #id, if you know it."},
+         "match": {"type": "string", "description": "Words from the entry - category, note or amount."},
+         "amount": {"type": "number"}, "kind": {"type": "string", "enum": ["in", "out"]},
+         "category": {"type": "string"}, "note": {"type": "string"}}),
+    _fn("delete_transaction", "Delete a logged entry, by id OR by description (match), e.g. 'the 5000 rent one'.",
+        {"transaction_id": {"type": "integer"},
+         "match": {"type": "string", "description": "Words from the entry."}}),
+    _fn("edit_reminder", "Change a reminder: wording, time, or how it repeats. Identify it by id OR by words from it (match), e.g. 'the gym one'. Pass repeat='none' to stop it repeating.",
+        {"reminder_id": {"type": "integer"},
+         "match": {"type": "string", "description": "Words from the reminder."},
+         "text": {"type": "string"},
          "when_iso": {"type": "string", "description": "New local ISO datetime."},
-         "repeat": {"type": "string", "description": "daily | weekdays | weekends | weekly | none"}},
-        ["reminder_id"]),
+         "repeat": {"type": "string", "description": "daily | weekdays | weekends | weekly | none"}}),
     _fn("add_habit", "Start tracking a repeating habit with a streak (gym, posting, reading).",
         {"title": {"type": "string"},
          "recur": {"type": "string", "description": "daily | weekly | 4x_week. Default daily."},
