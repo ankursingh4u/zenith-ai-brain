@@ -10,6 +10,16 @@ tzdata==2024.2                   # IANA timezone data (required on Windows)
 pypdf==5.0.1                     # extract text from statement PDFs
 price-parser==0.3.4              # deterministic money-amount extraction (cross-check the AI)
 
+# --- Web access + matching (free, keyless, small) ---
+# NOTE: ddgs DECLARES httpx>=0.28, but it actually makes its requests through
+# `primp`, so it runs fine on the httpx 0.27.2 pin above. Do NOT let pip
+# "resolve" that conflict by upgrading httpx — 0.28 breaks openai 1.54 with
+# "Client.__init__() got an unexpected keyword argument 'proxies'", which kills
+# every reply. Install with: pip install -r requirements.txt && pip install httpx==0.27.2
+ddgs==9.14.4                     # DuckDuckGo search — no API key, no quota
+trafilatura==2.1.0               # HTML -> readable article text (drops nav/ads)
+rapidfuzz==3.14.5                # approximate title matching (~1MB, C++)
+
 # --- Google login callback server ---
 fastapi==0.115.2
 uvicorn==0.31.0

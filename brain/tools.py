@@ -12,7 +12,8 @@ with the bot's service-account email, then registers the link. Everything else
 from __future__ import annotations
 
 import contextvars
-from datetime import datetime
+import json
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
@@ -20,7 +21,12 @@ from sqlalchemy import select
 import config
 import crypto
 import db
-from brain import money
+from brain import memory, money, web
+
+try:
+    from rapidfuzz import fuzz
+except ImportError:  # pragma: no cover — exact matching still works without it
+    fuzz = None
 from integrations import calendar as gcal
 from integrations import client as goauth
 from integrations import docs as gdocs
@@ -202,6 +208,230 @@ def list_bill_accounts(telegram_id: int) -> str:
 _REPEATS = {"daily", "weekdays", "weekends", "weekly"}
 
 
+_WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def _rem_local(r):
+    """A stored reminder's time in the user's own timezone."""
+    return r.due_at.replace(tzinfo=_UTC).astimezone(_TZ)
+
+
+def _repeat_days(local, repeat: str | None) -> set[int] | None:
+    """Which weekdays this reminder can land on. None = a one-off on a fixed date."""
+    rep = (repeat or "").strip().lower()
+    if rep == "daily":
+        return {0, 1, 2, 3, 4, 5, 6}
+    if rep == "weekdays":
+        return {0, 1, 2, 3, 4}
+    if rep == "weekends":
+        return {5, 6}
+    if rep == "weekly":
+        return {local.weekday()}
+    return None
+
+
+def _can_share_a_day(a_local, a_rep, b_local, b_rep) -> bool:
+    """Could these two ever fire on the SAME day? Two one-offs need the same date."""
+    a_days, b_days = _repeat_days(a_local, a_rep), _repeat_days(b_local, b_rep)
+    if a_days is None and b_days is None:
+        return a_local.date() == b_local.date()
+    if a_days is None:
+        return a_local.weekday() in b_days
+    if b_days is None:
+        return b_local.weekday() in a_days
+    return bool(a_days & b_days)
+
+
+def _clashes(telegram_id: int, local, repeat: str | None, window_min: int = 30,
+             skip_id: int | None = None) -> list[tuple]:
+    """Existing reminders within `window_min` of this one, on a day it could share.
+
+    Deterministic here on purpose — the assistant decides what to DO about a
+    clash, but it must never have to guess whether one exists.
+    """
+    out = []
+    mins = local.hour * 60 + local.minute
+    for r in db.list_reminders(telegram_id):
+        if skip_id is not None and r.id == skip_id:
+            continue
+        r_local = _rem_local(r)
+        if not _can_share_a_day(local, repeat, r_local, getattr(r, "repeat", None)):
+            continue
+        r_mins = r_local.hour * 60 + r_local.minute
+        gap = abs(mins - r_mins)
+        gap = min(gap, 1440 - gap)               # 23:50 and 00:05 are 15 apart
+        if gap <= window_min:
+            out.append((gap, r, r_local))
+    return sorted(out, key=lambda x: x[0])
+
+
+def check_time_free(telegram_id: int, when_iso: str, repeat: str | None = None,
+                    window_min: int = 30) -> str:
+    """Is this slot free? Call BEFORE promising a new time block."""
+    try:
+        local = datetime.fromisoformat(when_iso)
+    except ValueError:
+        return "I couldn't read that time. Give it as 2026-07-31T19:30:00."
+    if local.tzinfo is None:
+        local = local.replace(tzinfo=_TZ)
+    hits = _clashes(telegram_id, local, repeat, int(window_min or 30))
+    if not hits:
+        return (f"✅ {local:%H:%M} looks free — nothing else within "
+                f"{window_min} minutes of it.")
+    lines = []
+    for gap, r, r_local in hits[:6]:
+        every = f" 🔁 {r.repeat}" if getattr(r, "repeat", None) else f" ({r_local:%a %d %b})"
+        lines.append(f"• {r_local:%H:%M}{every} — {r.text} ({gap} min away)")
+    return (f"⚠️ {local:%H:%M} clashes with {len(hits)} thing(s):\n"
+            + "\n".join(lines)
+            + "\n\nPick a different time, move the existing one, or say it's fine to overlap.")
+
+
+def day_plan(telegram_id: int, day: str = "today") -> str:
+    """The timeline for one day — every reminder that fires, in order.
+
+    This is what makes 'where does 2 hours of dev actually fit?' answerable
+    instead of guessed.
+    """
+    now_local = datetime.now(_TZ)
+    want = (day or "today").strip().lower()
+    target = now_local.date()
+    if want == "tomorrow":
+        target = (now_local + timedelta(days=1)).date()
+    elif want in [d.lower() for d in _WEEKDAY_NAMES] or want in (
+            "monday", "tuesday", "wednesday", "thursday", "friday",
+            "saturday", "sunday"):
+        wanted = [d.lower() for d in _WEEKDAY_NAMES].index(want[:3])
+        ahead = (wanted - now_local.weekday()) % 7
+        target = (now_local + timedelta(days=ahead)).date()
+
+    rows = []
+    for r in db.list_reminders(telegram_id):
+        r_local = _rem_local(r)
+        days = _repeat_days(r_local, getattr(r, "repeat", None))
+        fires = (r_local.date() == target) if days is None else (target.weekday() in days)
+        if fires:
+            rows.append((r_local.hour * 60 + r_local.minute, r_local, r))
+    rows.sort(key=lambda x: x[0])
+
+    head = f"📅 {target:%A %d %b}"
+    if not rows:
+        return head + " — nothing scheduled. The whole day is free."
+    lines, prev = [], None
+    for mins, r_local, r in rows:
+        if prev is not None and mins - prev >= 60:
+            lines.append(f"    ({(mins - prev) // 60}h {(mins - prev) % 60}m free)")
+        every = f" 🔁 {r.repeat}" if getattr(r, "repeat", None) else ""
+        lines.append(f"{r_local:%H:%M} — {r.text}{every}")
+        prev = mins
+    return head + f" — {len(rows)} block(s):\n" + "\n".join(lines)
+
+
+def plan_gaps(telegram_id: int) -> str:
+    """Audit the plan for real holes: no gate, empty track, stalled, overdue, clashing.
+
+    Structural problems are found here in code so the assistant reports facts
+    rather than an impression.
+    """
+    now_local = datetime.now(_TZ)
+    now_utc = now_local.astimezone(_UTC).replace(tzinfo=None)
+    problems: list[str] = []
+
+    tops = db.tracks(telegram_id)
+    if not tops:
+        return ("No plan stored yet, so there's nothing to audit. Send me your "
+                "roadmap and I'll build the tree.")
+
+    for t in tops:
+        kids = db.children(telegram_id, t.id)
+        if not kids:
+            problems.append(f"🕳 Track '{t.title}' is empty — no phases under it.")
+        open_kids = [k for k in kids if k.status == "open" and k.kind != "habit"]
+        if kids and not open_kids:
+            problems.append(f"🏁 Track '{t.title}' has nothing open — finished, or it needs its next phase.")
+
+    no_gate, no_target, stalled, dupes = [], [], [], []
+    seen_titles: dict[str, str] = {}
+    for t in tops:
+        for k in db.children(telegram_id, t.id):
+            if k.kind == "habit":
+                continue
+            key = (k.title or "").strip().lower()
+            if key in seen_titles:
+                dupes.append(f"'{k.title}' appears in both {seen_titles[key]} and {t.title}")
+            else:
+                seen_titles[key] = t.title
+            if k.status != "open":
+                continue
+            if not (k.gate or "").strip():
+                no_gate.append(f"{t.title} / {k.title}")
+            elif not k.target and not db.children(telegram_id, k.id):
+                no_target.append(f"{t.title} / {k.title}")
+    if no_gate:
+        problems.append("🚧 No gate — you can't tell when these are done:\n   "
+                        + "\n   ".join(no_gate[:8]))
+    if no_target:
+        problems.append("🔢 No countable target (fine if the gate is a demonstrated "
+                        "skill, worth adding if it's volume work):\n   "
+                        + "\n   ".join(no_target[:6]))
+    if dupes:
+        problems.append("👯 Same thing in two places:\n   " + "\n   ".join(dupes[:5]))
+
+    # The phase in play in each track, sitting at zero — the real "stalled" signal.
+    for t in tops:
+        open_kids = [k for k in db.children(telegram_id, t.id)
+                     if k.status == "open" and k.kind != "habit"]
+        if not open_kids:
+            continue
+        cur = open_kids[0]
+        age_days = (now_utc - cur.created_at).days if cur.created_at else 0
+        if age_days >= 14 and not (cur.progress or 0):
+            stalled.append(f"{t.title} / {cur.title} — {age_days} days, zero progress")
+    if stalled:
+        problems.append("🧊 Stalled:\n   " + "\n   ".join(stalled))
+
+    overdue = db.list_tasks(telegram_id, "open", due_before=now_utc)
+    if overdue:
+        problems.append(f"⏳ Overdue ({len(overdue)}):\n   "
+                        + "\n   ".join(f"{o.title}" for o in overdue[:6]))
+
+    cold = []
+    for h in db.habits(telegram_id):
+        if h.last_done_at is None:
+            cold.append(f"{h.title} — never ticked off")
+        else:
+            days = (now_utc.date() - h.last_done_at.date()).days
+            limit = 7 if (h.recur or "").startswith("week") else 3
+            if days > limit:
+                cold.append(f"{h.title} — {days} days ago (streak {h.streak or 0} is at risk)")
+    if cold:
+        problems.append("🔁 Habits gone cold:\n   " + "\n   ".join(cold))
+
+    reminders = db.list_reminders(telegram_id)
+    reported: set[frozenset] = set()
+    clash_lines = []
+    for r in reminders:
+        r_local = _rem_local(r)
+        # Tighter than the insert warning: back-to-back blocks 20 minutes apart
+        # are a routine, not a conflict. Only real overlaps belong in an audit.
+        for gap, other, o_local in _clashes(
+                telegram_id, r_local, getattr(r, "repeat", None), 15, skip_id=r.id):
+            pair = frozenset((r.id, other.id))
+            if pair in reported:
+                continue
+            reported.add(pair)
+            clash_lines.append(f"{r_local:%H:%M} '{r.text}' vs {o_local:%H:%M} "
+                               f"'{other.text}' — {gap} min apart")
+    if clash_lines:
+        problems.append("⏰ Reminders on top of each other:\n   "
+                        + "\n   ".join(clash_lines[:6]))
+
+    if not problems:
+        return ("✅ No structural gaps: every open phase has a gate, nothing is "
+                "stalled or overdue, habits are warm, no reminder clashes.")
+    return "Gaps in your plan:\n\n" + "\n\n".join(problems)
+
+
 def set_reminder(telegram_id: int, text: str, when_iso: str,
                  repeat: str | None = None) -> str:
     """when_iso is a local-time ISO datetime. `repeat` makes it recur."""
@@ -223,6 +453,9 @@ def set_reminder(telegram_id: int, text: str, when_iso: str,
         elif repeat == "weekends":
             while local.weekday() < 5:
                 local += timedelta(days=1)
+    # Look for a clash BEFORE inserting, so the warning describes the old blocks
+    # rather than the one we just added.
+    hits = _clashes(telegram_id, local, repeat)
     due_utc = local.astimezone(_UTC).replace(tzinfo=None)   # store naive UTC
     db.add_reminder(telegram_id, text, due_utc, repeat)
     when = f"every day at {local:%H:%M}" if repeat == "daily" else (
@@ -230,7 +463,17 @@ def set_reminder(telegram_id: int, text: str, when_iso: str,
             f"every weekend day at {local:%H:%M}" if repeat == "weekends" else (
                 f"every {local:%A} at {local:%H:%M}" if repeat == "weekly"
                 else f"{local:%a %d %b %Y, %H:%M}")))
-    return f"⏰ Reminder set for {when}: {text}"
+    out = f"⏰ Reminder set for {when}: {text}"
+    if hits:
+        # Set anyway — the user's time is theirs — but never silently double-book.
+        out += (f"\n\n⚠️ Heads up, this sits on top of {len(hits)} existing block(s):\n"
+                + "\n".join(
+                    f"• {o_local:%H:%M}"
+                    + (f" 🔁 {o.repeat}" if getattr(o, "repeat", None) else "")
+                    + f" — {o.text} ({gap} min away)"
+                    for gap, o, o_local in hits[:4])
+                + "\nTell me if you want either one moved.")
+    return out
 
 
 def list_reminders(telegram_id: int) -> str:
@@ -376,15 +619,115 @@ def update_task(telegram_id: int, task_id: int, title: str | None = None,
 
 
 def recall(telegram_id: int, about: str, limit: int = 12) -> str:
-    """Search this user's own past messages — memory beyond the recent window."""
-    rows = db.search_turns(telegram_id, about, max(1, min(int(limit or 12), 25)))
-    if not rows:
-        return f"Nothing in our history about '{about}'."
+    """Search this user's own past — by MEANING first, keywords as backup.
+
+    Semantic hits catch "what did I decide about caching" when the message
+    actually said "Redis cache-aside". Keyword hits catch exact names and
+    numbers that embeddings blur. Both are used, and duplicates dropped.
+    """
+    cap = max(1, min(int(limit or 12), 25))
+    seen: set[str] = set()
     out = []
-    for r in rows:
+
+    for hit in memory.search(telegram_id, about, cap):
+        key = hit["text"][:120]
+        if key in seen:
+            continue
+        seen.add(key)
+        when = hit["when"].strftime("%d %b") if hit.get("when") else "earlier"
+        out.append(f"[{when}] {hit['text'][:300]}")
+
+    for r in db.search_turns(telegram_id, about, cap):
+        key = (r["content"] or "")[:120]
+        if key in seen:
+            continue
+        seen.add(key)
         who = "You" if r["role"] == "user" else "Me"
         out.append(f"[{r['when']}] {who}: {r['content'][:300]}")
-    return f"From our earlier chats about '{about}':\n" + "\n".join(out)
+
+    if not out:
+        return f"Nothing in our history about '{about}'."
+    how = "" if memory.available() else " (keyword search only — semantic memory is off)"
+    return (f"From our earlier chats about '{about}'{how}:\n"
+            + "\n".join(out[:cap]))
+
+
+def web_search(telegram_id: int, query: str, count: int = 5) -> str:
+    """Search the open web — free, no API key needed."""
+    try:
+        hits = web.search(query, count)
+    except Exception as e:  # noqa: BLE001 — report it, never crash the turn
+        return (f"Couldn't search just now ({e}). Answer from what you know, "
+                "and say plainly that you couldn't verify it.")
+    if not hits:
+        return f"No results for '{query}'."
+    out = []
+    for h in hits:
+        line = f"• {h['title']}\n  {h['url']}"
+        if h["snippet"]:
+            line += f"\n  {h['snippet'][:220]}"
+        out.append(line)
+    return (f"🔎 Web results for '{query}':\n" + "\n".join(out)
+            + "\n\n(These are snippets. Call read_page on the best link before "
+              "stating a number, price, version or command.)")
+
+
+def read_page(telegram_id: int, url: str, max_chars: int = 6000) -> str:
+    """Fetch one page and return its readable text."""
+    try:
+        text = web.read(url, max_chars)
+    except Exception as e:  # noqa: BLE001
+        return f"Couldn't read that page: {e}"
+    return f"📄 From {url}:\n\n{text}"
+
+
+def list_recent_changes(telegram_id: int, limit: int = 8) -> str:
+    """What was changed recently, newest first — the undo menu."""
+    rows = db.recent_actions(telegram_id, max(1, min(int(limit or 8), 20)))
+    if not rows:
+        return "No changes recorded yet."
+    lines = []
+    for i, a in enumerate(rows, 1):
+        local = a.created_at.replace(tzinfo=_UTC).astimezone(_TZ)
+        mark = " (already undone)" if a.undone else ""
+        lines.append(f"{i}. {local:%d %b %H:%M} — {a.summary or a.tool}{mark}")
+    return ("Recent changes (newest first):\n" + "\n".join(lines)
+            + "\n\nSay 'undo that' for the newest, or 'undo 3' for the third.")
+
+
+def undo_last(telegram_id: int, steps: int = 1) -> str:
+    """Roll the plan and reminders back to before a recent change.
+
+    Snapshot-based, so it correctly reverses ANY plan/reminder tool — including
+    a clear_plan or an add_plan that replaced a track. Money is untouched:
+    transactions have their own undo, and quietly rewinding accounting inside a
+    plan undo would be unsafe.
+    """
+    try:
+        n = max(1, int(steps or 1))
+    except (TypeError, ValueError):
+        n = 1
+    rows = db.recent_actions(telegram_id, 20, only_undoable=True)
+    if not rows:
+        return ("Nothing to undo — I have no recorded change for you yet. "
+                "(Money is separate: use undo_last_transaction for that.)")
+    if n > len(rows):
+        return (f"I only have {len(rows)} undoable change(s). "
+                + list_recent_changes(telegram_id))
+    target = rows[n - 1]
+    try:
+        snap = json.loads(target.snapshot)
+    except (TypeError, ValueError):
+        return "That undo point is unreadable, sorry — nothing was changed."
+    tasks, rems = db.restore_user(telegram_id, snap)
+    # Everything from this point forward is now void, so it can't be re-applied.
+    for a in rows[:n]:
+        db.mark_undone(telegram_id, a.id)
+    local = target.created_at.replace(tzinfo=_UTC).astimezone(_TZ)
+    return (f"↩️ Rolled back to before: {target.summary or target.tool} "
+            f"({local:%d %b %H:%M}).\n"
+            f"Your plan is restored to {tasks} item(s) and {rems} reminder(s).\n"
+            "Say 'show plan' to check it.")
 
 
 def remember_about_me(telegram_id: int, fact: str, replace: bool = False) -> str:
@@ -553,6 +896,167 @@ def add_plan(telegram_id: int, plan: list, replace: bool = False) -> str:
             + f"\n\n{total} nodes stored. Ask 'show plan' any time, or 'what now?'.")
 
 
+def _node_label(t) -> str:
+    """One readable line for a plan node — used when confirming an edit."""
+    bits = [f"#{t.id} {t.title}"]
+    if t.kind != "task":
+        bits.append(f"({t.kind})")
+    if t.track:
+        bits.append(f"in {t.track}")
+    line = " ".join(bits)
+    if t.target:
+        line += f" — {t.progress or 0}/{t.target}"
+    if t.status != "open":
+        line += f" — {t.status}"
+    if t.recur:
+        line += f" — {t.recur}"
+    if t.gate:
+        line += f"\n     gate: {t.gate}"
+    if t.notes:
+        line += f"\n     notes: {t.notes[:200]}"
+    return line
+
+
+def _fuzzy_nodes(telegram_id: int, title: str, kinds: tuple[str, ...] | None = None,
+                 cutoff: int = 72) -> list:
+    """Approximate title match — catches typos and rewordings.
+
+    Only ever used AFTER an exact/substring search found nothing, so it can't
+    hijack a match the user clearly meant. Degrades to [] without rapidfuzz.
+    """
+    if fuzz is None or not (title or "").strip():
+        return []
+    rows = [t for t in db.list_tasks(telegram_id, status="all", limit=500)
+            if not kinds or t.kind in kinds]
+    scored = []
+    for t in rows:
+        name = (t.title or "")
+        # partial_ratio so "histogram" scores against "P3 Stack — histogram cold".
+        score = max(fuzz.WRatio(title, name), fuzz.partial_ratio(title.lower(),
+                                                                name.lower()))
+        if score >= cutoff:
+            scored.append((score, t))
+    if not scored:
+        return []
+    scored.sort(key=lambda x: -x[0])
+    best = scored[0][0]
+    # Keep only the clearly-best group, so we ask "which?" only on a real tie.
+    return [t for s, t in scored if best - s <= 5][:8]
+
+
+def _pick_node(telegram_id: int, item_id, title: str | None,
+               kinds: tuple[str, ...] | None = None):
+    """Resolve ANY plan node from an id and/or words from its title.
+
+    Unlike _pick_task this finds tracks, phases, habits and finished items too,
+    so 'change the P3 gate' or 'reopen P1' can actually land on something.
+    """
+    try:
+        nid = int(item_id) if item_id not in (None, "") else None
+    except (TypeError, ValueError):
+        nid = None
+    if nid is not None and nid > 0:
+        t = db.get_task(telegram_id, nid)
+        if t is not None:
+            return t, None
+    if title:
+        matches = db.find_nodes(telegram_id, title, kinds)
+        if not matches:
+            # Nothing matched literally — try approximately, so "P3 stak" and
+            # "the histogram phase" still land instead of dead-ending.
+            matches = _fuzzy_nodes(telegram_id, title, kinds)
+        if len(matches) == 1:
+            return matches[0], None
+        if len(matches) > 1:
+            return None, ("More than one matches — which?\n"
+                          + "\n".join(_node_label(m) for m in matches[:8]))
+        return None, f"Nothing in your plan matches '{title}'."
+    if nid is not None and nid > 0:
+        return None, f"No item #{nid}."
+    return None, "Tell me which item — its number or a few words from it."
+
+
+def edit_plan_item(telegram_id: int, item_id: int | None = None,
+                   title: str | None = None, new_title: str | None = None,
+                   notes: str | None = None, gate: str | None = None,
+                   target: int | None = None, progress: int | None = None,
+                   recur: str | None = None, priority: int | None = None,
+                   status: str | None = None, due_iso: str | None = None) -> str:
+    """Change one field of an existing plan item in place — no re-sending the plan.
+
+    This is the fix for "the P3 gate is wrong": before, the only way to correct a
+    phase was add_plan with replace, which threw away all recorded progress.
+    """
+    node, problem = _pick_node(telegram_id, item_id, title)
+    if problem:
+        return problem
+    t = db.update_task(
+        telegram_id, node.id, new_title, notes, priority,
+        _due_utc(due_iso), False, gate, target, progress, recur, status,
+    )
+    if t is None:
+        return f"Couldn't update #{node.id}."
+    return "✏️ Updated:\n" + _node_label(t)
+
+
+def add_to_plan(telegram_id: int, parent: str, items: list) -> str:
+    """Append phases/tasks/habits UNDER an existing track or phase.
+
+    Without this, adding one phase meant calling add_plan again — which replaces
+    the same-named track and silently destroys every other phase under it.
+    """
+    node, problem = _pick_node(telegram_id, None, parent,
+                               ("track", "phase", "task"))
+    if problem:
+        return problem
+    if isinstance(items, (str, dict)):
+        items = [items]
+    if not items:
+        return "Nothing to add."
+    start = db.next_order_idx(telegram_id, node.id)
+    made = 0
+    names = []
+    for i, item in enumerate(items[:40]):
+        if isinstance(item, str):
+            item = {"title": item}
+        if not isinstance(item, dict) or not str(item.get("title") or "").strip():
+            continue
+        n = _node_from(telegram_id, item, node.id, node.track or node.title,
+                       start + i)
+        if n:
+            made += n
+            names.append(str(item["title"]))
+    if not made:
+        return "None of those had a title I could use."
+    return (f"➕ Added under {node.title}:\n"
+            + "\n".join(f"• {n}" for n in names)
+            + f"\n\n{made} node(s) stored. Everything already in {node.title} is untouched.")
+
+
+def remove_plan_item(telegram_id: int, item_id: int | None = None,
+                     title: str | None = None) -> str:
+    """Delete ONE phase/task/habit (and anything under it) without touching the rest."""
+    node, problem = _pick_node(telegram_id, item_id, title)
+    if problem:
+        return problem
+    label = node.title
+    gone = db.delete_subtree(telegram_id, node.id)
+    extra = f" and {gone - 1} item(s) under it" if gone > 1 else ""
+    return f"🗑 Removed {label}{extra}. The rest of your plan is untouched."
+
+
+def reopen_item(telegram_id: int, item_id: int | None = None,
+                title: str | None = None) -> str:
+    """Put a wrongly-completed or dropped item back to open."""
+    node, problem = _pick_node(telegram_id, item_id, title)
+    if problem:
+        return problem
+    if node.status == "open":
+        return f"{node.title} is already open."
+    t = db.update_task(telegram_id, node.id, status="open")
+    return f"↩️ Reopened: {t.title}" if t else f"Couldn't reopen #{node.id}."
+
+
 def _bar(done: int, total: int) -> str:
     if not total:
         return ""
@@ -650,7 +1154,7 @@ def show_plan(telegram_id: int, track: str | None = None, full: bool = False) ->
     return "\n".join(out)[:3800]
 
 
-def plan_snapshot(telegram_id: int, max_chars: int = 1200) -> str:
+def plan_snapshot(telegram_id: int, max_chars: int = 2200) -> str:
     """A compact always-on view of the plan for the system prompt.
 
     Only what's needed to stay aware: each track, the phase currently in play,
@@ -748,6 +1252,10 @@ def log_progress(telegram_id: int, task_id: int | None = None,
 def check_habit(telegram_id: int, title: str) -> str:
     """Tick off a repeating habit (calisthenics, X post, reading) and keep the streak."""
     matches = [h for h in db.habits(telegram_id) if title.lower() in (h.title or "").lower()]
+    if not matches and fuzz is not None:
+        # "did callisthenics" / "gym done" should still tick the right habit.
+        scored = [(fuzz.WRatio(title, h.title or ""), h) for h in db.habits(telegram_id)]
+        matches = [h for s, h in sorted(scored, key=lambda x: -x[0]) if s >= 72][:1]
     if not matches:
         names = ", ".join(h.title for h in db.habits(telegram_id)) or "none set up"
         return f"No habit matching '{title}'. Your habits: {names}."
@@ -1328,7 +1836,15 @@ TOOLS: dict[str, callable] = {
     "remember_about_me": remember_about_me,
     "my_profile": my_profile,
     "forget_about_me": forget_about_me,
+    "web_search": web_search,
+    "read_page": read_page,
+    "undo_last": undo_last,
+    "list_recent_changes": list_recent_changes,
     "show_plan": show_plan,
+    "add_to_plan": add_to_plan,
+    "edit_plan_item": edit_plan_item,
+    "remove_plan_item": remove_plan_item,
+    "reopen_item": reopen_item,
     "what_now": what_now,
     "log_progress": log_progress,
     "check_habit": check_habit,
@@ -1337,6 +1853,9 @@ TOOLS: dict[str, callable] = {
     "update_task": update_task,
     "drop_task": drop_task,
     "set_reminder": set_reminder,
+    "check_time_free": check_time_free,
+    "day_plan": day_plan,
+    "plan_gaps": plan_gaps,
     "list_reminders": list_reminders,
     "cancel_reminder": cancel_reminder,
     "save_password": save_password,
@@ -1423,6 +1942,18 @@ SCHEMAS: list[dict] = [
         {"fact": {"type": "string", "description": "One short line, e.g. 'Runs a hardware shop in Ajmer' or 'Training for a marathon in Nov'."},
          "replace": {"type": "boolean", "description": "True to replace the whole profile. Default false (append)."}},
         ["fact"]),
+    _fn("web_search", "Search the live web. Use it whenever the answer depends on something current or checkable rather than something you already know for certain: prices, free-tier limits, library or runtime versions, docs, error messages, release notes, news, 'is X still true'. Prefer searching over hedging — but if the user only wants your opinion or your reasoning, just answer.",
+        {"query": {"type": "string", "description": "What to search for. Write it like a search query, not a sentence."},
+         "count": {"type": "integer", "description": "How many results. Default 5, max 10."}},
+        ["query"]),
+    _fn("read_page", "Open one URL and read its actual text. ALWAYS do this before you state a specific number, price, version, limit, config value or command that came from a search — search snippets are truncated and often stale or wrong. Also use it when the user pastes a link and asks what it says.",
+        {"url": {"type": "string", "description": "The full http(s) URL."},
+         "max_chars": {"type": "integer", "description": "How much text to pull back. Default 6000."}},
+        ["url"]),
+    _fn("undo_last", "REVERSE a recent change to the plan, tasks, habits, reminders or profile. Use the moment the user says 'undo', 'undo that', 'revert', 'put it back', 'that was wrong', 'I didn't want that'. It restores the exact state from before the change, so it correctly reverses even a clear_plan or an add_plan that replaced a track. Does NOT touch money — for a wrong transaction use undo_last_transaction instead.",
+        {"steps": {"type": "integer", "description": "1 = the newest change (default). 2 = the one before it, and so on. Call list_recent_changes first if they mean something further back."}}),
+    _fn("list_recent_changes", "Show the recent changes you've made to their plan/reminders, newest first, as an undo menu. Use for 'what did you just change', 'what did you do', or before undoing something further back than the last action.",
+        {"limit": {"type": "integer", "description": "How many to list. Default 8."}}),
     _fn("my_profile", "Show what you currently know about this user.", {}),
     _fn("forget_about_me", "Remove a remembered fact, or clear the profile if no fact is given.",
         {"fact": {"type": "string", "description": "Words from the line to drop. Omit to clear everything."}}),
@@ -1454,6 +1985,39 @@ SCHEMAS: list[dict] = [
     _fn("show_plan", "Show the plan. SHORT by default — one line per track with progress and the phase in play. Pass track to open one area's phases, or full=true only when the user explicitly asks for the whole thing.",
         {"track": {"type": "string", "description": "Open one area, e.g. 'DSA'."},
          "full": {"type": "boolean", "description": "True ONLY if they asked for the full/complete plan. It is long."}}),
+    _fn("add_to_plan", "ADD one or more phases/tasks/habits UNDER something that already exists, keeping everything else in place. Use this for 'add a phase to my DSA track', 'put these 3 tasks under P5', 'add a habit to Life'. NEVER use add_plan for an addition — add_plan replaces the whole same-named track and would destroy the other phases and their progress.",
+        {"parent": {"type": "string", "description": "Words from the track/phase it goes under, e.g. 'DSA' or 'P5 Async'."},
+         "items": {"type": "array", "description": "The new nodes.",
+                   "items": {"type": "object", "properties": {
+                       "title": {"type": "string"},
+                       "kind": {"type": "string", "enum": ["phase", "task", "habit"]},
+                       "notes": {"type": "string"},
+                       "gate": {"type": "string", "description": "What proves it's finished."},
+                       "target": {"type": "integer", "description": "Countable goal, e.g. 45 problems."},
+                       "recur": {"type": "string", "description": "For habits: daily, weekly, 4x_week."},
+                       "priority": {"type": "integer"},
+                       "due_iso": {"type": "string"},
+                       "children": {"type": "array", "items": {"type": "object"}},
+                   }, "required": ["title"]}}},
+        ["parent", "items"]),
+    _fn("edit_plan_item", "CHANGE one existing plan item in place — its title, notes, GATE, target, progress, recurrence, priority or status. Use for 'the P3 gate should be X', 'make DSA P1 60 problems', 'rename that phase', 'I'm actually at 12 problems'. Pass ONLY the fields that change. Never re-send the whole plan to fix one line — that wipes recorded progress.",
+        {"item_id": {"type": "integer", "description": "The #number if you know it."},
+         "title": {"type": "string", "description": "Words from the item's current name, if no id."},
+         "new_title": {"type": "string", "description": "Only if renaming it."},
+         "notes": {"type": "string"},
+         "gate": {"type": "string", "description": "New definition of done."},
+         "target": {"type": "integer"},
+         "progress": {"type": "integer", "description": "Set the count outright (log_progress adds to it instead)."},
+         "recur": {"type": "string"},
+         "priority": {"type": "integer"},
+         "status": {"type": "string", "enum": ["open", "done", "dropped"]},
+         "due_iso": {"type": "string"}}),
+    _fn("remove_plan_item", "DELETE one phase/task/habit and anything under it, leaving the rest of the plan alone. Use for 'drop P8 from DSA', 'remove that habit'. Use clear_plan only when they want a WHOLE track or the entire plan gone.",
+        {"item_id": {"type": "integer"},
+         "title": {"type": "string", "description": "Words from the item to remove."}}),
+    _fn("reopen_item", "Put a wrongly completed or dropped item back to open. Use for 'I marked that done by mistake', 'undo that', 'P2 isn't actually finished'.",
+        {"item_id": {"type": "integer"},
+         "title": {"type": "string", "description": "Words from the item."}}),
     _fn("what_now", "Decide the ONE next thing to do from the plan, plus anything overdue and habits not done today. Use for 'what now?', 'I'm free', 'what should I do'.", {}),
     _fn("log_progress", "Record countable progress on an item, e.g. 'solved 5 problems'. Clears the item automatically when it hits its target.",
         {"task_id": {"type": "integer"}, "title": {"type": "string", "description": "A word from the item, if no id."},
@@ -1481,6 +2045,15 @@ SCHEMAS: list[dict] = [
          "repeat": {"type": "string", "enum": ["daily", "weekdays", "weekends", "weekly"],
                     "description": "Omit for a one-off. 'weekdays' = Mon-Fri."}},
         ["text", "when_iso"]),
+    _fn("check_time_free", "Check whether a time slot is free BEFORE you promise it. Call this whenever you're about to place a new time block, or when the user asks 'can I fit X at 7pm'. It reports which existing reminders are within 30 minutes of that time on a day it could share.",
+        {"when_iso": {"type": "string", "description": "Local ISO datetime to test, e.g. 2026-07-31T19:30:00."},
+         "repeat": {"type": "string", "enum": ["daily", "weekdays", "weekends", "weekly"],
+                    "description": "The repeat the new block would have. Omit for a one-off."},
+         "window_min": {"type": "integer", "description": "How close counts as a clash. Default 30."}},
+        ["when_iso"]),
+    _fn("day_plan", "Show one day's timeline — every reminder that fires that day in order, with the free gaps between them marked. Use for 'what does my Tuesday look like', 'where can I fit 2 hours', or before rearranging someone's routine. Answer scheduling questions from THIS, never from memory.",
+        {"day": {"type": "string", "description": "'today', 'tomorrow', or a weekday name like 'saturday'. Default today."}}),
+    _fn("plan_gaps", "Audit the plan for real holes and report facts: open phases with no gate, empty tracks, phases stalled at zero progress for 2+ weeks, overdue items, habits gone cold, the same phase duplicated in two tracks, and reminders sitting on top of each other. Use for 'what am I missing', 'where are the gaps', 'audit my plan', 'am I on track', or during a weekly review.", {}),
     _fn("list_reminders", "List the user's pending reminders.", {}),
     _fn("cancel_reminder", "Cancel a reminder, by id OR by words from it (match).",
         {"reminder_id": {"type": "integer"},

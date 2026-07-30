@@ -41,6 +41,19 @@ FAST_MODEL = os.getenv("FAST_MODEL", "gpt-4o-mini").strip()
 # aliases accept an image and silently return nulls, which loses every receipt.
 VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o").strip()
 
+# Semantic memory. Embeddings let "what did I decide about caching" find the
+# right message even when it shares no keyword with what was written. If the
+# endpoint doesn't serve embeddings (some gateways don't), recall degrades to
+# keyword search instead of breaking — see brain/memory.py.
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small").strip()
+EMBED_ENABLED = os.getenv("EMBED_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+# How many past items the semantic search may consider. Cosine over a few
+# thousand short vectors in Python is milliseconds; this is just a sanity cap.
+MEMORY_SCAN_LIMIT = int(os.getenv("MEMORY_SCAN_LIMIT", "4000"))
+# How many undo points to keep per user. Each is a snapshot of that user's
+# plan + reminders, so this is kilobytes, not megabytes.
+UNDO_HISTORY = int(os.getenv("UNDO_HISTORY", "20"))
+
 # --- Voice (speech-to-text + text-to-speech) ---
 STT_MODEL = os.getenv("STT_MODEL", "whisper-1").strip()        # transcription
 # Force a transcription language (e.g. "hi" or "en"); empty = auto-detect.

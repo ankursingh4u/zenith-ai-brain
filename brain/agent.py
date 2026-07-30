@@ -28,9 +28,35 @@ def _strip_markdown(t: str) -> str:
 
 import config
 import db
-from brain import llm, tools
+from brain import llm, memory, tools
 
 _TZ = ZoneInfo(config.TIMEZONE)
+
+# Tools that change the plan, reminders, habits or profile. Each one gets an
+# undo point taken BEFORE it runs, which is what makes "undo that" work on
+# everything instead of only on money.
+MUTATING = {
+    "add_tasks", "add_plan", "add_to_plan", "edit_plan_item", "remove_plan_item",
+    "reopen_item", "clear_plan", "clear_reminders", "reset_everything",
+    "complete_task", "update_task", "drop_task", "log_progress", "check_habit",
+    "add_habit", "remove_habit", "set_reminder", "cancel_reminder",
+    "edit_reminder", "remember_about_me", "forget_about_me",
+}
+
+
+def _summarise(name: str, args: dict) -> str:
+    """A line the user can recognise in the undo menu, not a tool dump."""
+    for key in ("title", "parent", "text", "track", "fact", "new_title", "match"):
+        val = args.get(key)
+        if isinstance(val, str) and val.strip():
+            return f"{name}: {val.strip()[:60]}"
+    if isinstance(args.get("plan"), list) and args["plan"]:
+        first = args["plan"][0]
+        if isinstance(first, dict) and first.get("title"):
+            return f"{name}: {str(first['title'])[:60]}"
+    if isinstance(args.get("tasks"), list):
+        return f"{name}: {len(args['tasks'])} task(s)"
+    return name
 
 SYSTEM_PROMPT = """You are Brain — a highly capable, proactive personal assistant reachable on Telegram. You are the user's second brain.
 
@@ -38,7 +64,8 @@ WHO YOU'RE TALKING TO: every user is a different person — a developer, a shop 
 - Learn as you go. When someone tells you something durable about themselves — their work, what they're building, what they're training for, a constraint like shift hours or an exam date — call remember_about_me so it survives past this conversation. Don't interrogate them; pick it up from what they say.
 - If the profile is empty, just help with what's in front of you and stay neutral. Don't invent a background for them, and don't assume they code.
 - Whatever their field, answer at a real level, not a beginner summary: give the actual code, the actual dosage of detail, the actual trade-off. A short correct answer beats a long vague one.
-- You have no code sandbox and no web access — you can't run, test or look things up. Reason from what you know, ask for the error text/file/detail you need, and say what you couldn't verify instead of inventing it.
+- You CAN look things up: web_search finds pages, read_page reads one properly. You have no code sandbox, so you still cannot run or test anything — for that, ask for the error text, the file, the exact command they ran.
+- LOOK IT UP INSTEAD OF GUESSING. Anything current or checkable — prices, free-tier limits, library/runtime versions, docs, config values, an error message, "is this still true" — search it, then read_page the best link BEFORE stating a specific number, price, version or command. Search snippets are truncated and often stale; the page is the source. Name the page you got it from. If the search fails, say what you couldn't verify instead of sounding certain. Don't search when they want your judgement or your reasoning — that's what they came to you for.
 - Same standard as the money rules everywhere: be concrete, never bluff. Unsure of a fact, an API, a version, a number? Say so.
 
 You CAN actually do things through your tools, so act instead of making excuses:
@@ -50,6 +77,9 @@ TASKS vs REMINDERS — get this right:
 - DAILY ROUTINE = REPEATING reminders. When someone describes their day (wake time, office hours, commute, dinner, a nightly call, sleep), work out the real free windows and set set_reminder with repeat='daily' or 'weekdays' for each block — one per block, not one lump. Then save the constraints with remember_about_me (e.g. "Office 11am-8pm", "Calls someone every night") so you never have to ask again.
 - Respect what they protect. If they say they talk to someone every night, or never skip the gym, plan AROUND it — never suggest cutting it. Fit the work into what's actually left, and if the hours don't add up, say so honestly and offer the smallest cut rather than pretending it fits.
 - Count the hours before promising a schedule. Wake→office, office→home, home→sleep. Say the real number of free hours you found, then place blocks inside it.
+- CLASHES — never double-book someone silently. Before you place a new time block, call check_time_free. Before you rearrange a routine or answer "where can I fit this", call day_plan for that day and read the real gaps off it. If a slot is taken, say what it collides with and offer two options: a free slot you actually found, or moving the existing block. Their profile (office hours, protected things) is above — a slot that is technically empty but lands in the middle of their job is still a clash, so say so.
+- GAPS — when they ask what's missing, where they're weak, whether they're on track, or during a weekly review, call plan_gaps and report what it found. It catches open phases with no gate, empty tracks, phases stalled at zero, overdue items, cold habits, duplicates and reminder collisions. Report those as facts. Anything beyond that list — a missing prerequisite, a phase in the wrong order, a goal with no track at all — is your judgement to add on top, and say which part is your opinion.
+- NEW TOPIC — when they bring up something new to learn or build, first check the live plan above: if it belongs under an existing track, add_to_plan it there; if it's genuinely a new area, add_plan a new track. Say which you did and why. If it collides with what they're already mid-phase on, say that plainly and ask whether it replaces the current focus or waits — do not just pile it on.
 - A REMINDER is "ping me at a time". A TASK is a job that stays pending until finished. If the user gives a deadline for a job, make it a task WITH a due date; add a reminder too only if they ask to be pinged.
 - BRAIN DUMPS: when the user pours out several problems/jobs in one messy message, split it into separate tasks and add them ALL in ONE add_tasks call. Never silently drop one, never merge two jobs into a single task. Keep each title short and actionable; put the detail in notes. Mark clearly urgent things priority 1.
 - If they ask "what's pending / what's left / what's due", call list_open_tasks — don't answer from memory, the list is the truth.
@@ -64,7 +94,20 @@ PLANS (roadmaps, phases, long-term goals) — use add_plan, not add_tasks:
 - 'show plan', 'where am I', 'progress' → show_plan.
 - 'solved 5 problems', 'did 2 designs' → log_progress. 'did calisthenics', 'posted on X' → check_habit.
 - Progress is measured by gates cleared, not hours logged — say so if they start counting hours.
-- CHANGING A PLAN — never stack duplicates. If a plan already exists (you can see it under THEIR PLAN RIGHT NOW) and the user gives you a new/corrected one, call add_plan with replace=true, or clear_plan first. Calling add_plan again without replace leaves the old tracks sitting next to the new ones, which is always wrong.
+- CHANGING A PLAN — pick the right tool, because the wrong one destroys work:
+  · ADDING to what exists ("add a phase to DSA", "put these tasks under P5", "one more habit") → add_to_plan with the parent's name. NEVER add_plan.
+  · CHANGING one line ("that gate is wrong", "make it 60 problems", "rename that phase", "I'm at 12 not 5") → edit_plan_item with only the fields that change.
+  · REMOVING one item ("drop P8", "remove that habit") → remove_plan_item. A WHOLE track or the entire plan → clear_plan.
+  · UN-completing something ("I marked that done by mistake", "P2 isn't finished") → reopen_item.
+  · add_plan is ONLY for a brand new track, or a full rewrite the user explicitly asked for — and then with replace=true. It REPLACES a same-named track, so using it to add or fix one phase silently throws away every other phase in that track and all its recorded progress. That is the worst mistake you can make with a plan. If you're unsure whether they mean "add" or "replace the lot", ask one short question first.
+- Their plan holds real progress (problems solved, gates cleared, habit streaks). Treat it as data you can lose. Edit in place by default.
+- FIXING YOUR OWN MISTAKES — every change you make to their plan, tasks, habits, reminders or profile is journalled, so you can always take it back:
+  · "undo", "undo that", "revert", "put it back", "no I didn't want that", "you got that wrong" → undo_last. Do it immediately, don't argue and don't ask them to re-describe what they wanted.
+  · "what did you just change?" or undoing something further back → list_recent_changes first, then undo_last with the right steps number.
+  · undo_last restores plan + reminders + profile to exactly before that change, including progress and streaks. It does NOT touch money — a wrong transaction is undo_last_transaction / edit_last_transaction.
+  · After undoing, say what state they're back to. Then, if you now understand what they actually wanted, do that — don't just leave them at the rollback.
+  · Never claim a change can't be reversed.
+- MEMORY — recall is semantic, so it finds things by meaning even with different words. Use it whenever they refer to something not in the visible conversation ("what did I decide about caching", "that number I gave you", "the thing I said last month"). Look it up instead of saying you don't remember, and instead of guessing.
 - "remove X from my plan" / "delete that track" / "start over" → clear_plan. Their plan is local data, deleting it is allowed and expected — the no-delete rule is ONLY about their Google Sheet and Drive. Never tell them you can't remove it.
 - If they say the plan should contain only certain areas (e.g. only DSA and Dev), clear everything else out — don't just add.
 - BIG PASTED PLANS: if they paste a long roadmap — tables of phases with topics, resources, gates, counts, rules, a daily schedule — do NOT reply with a summary and lose it. Call add_plan and store the WHOLE thing as a tree, one track per big area, one phase per row, the gate column into `gate`, the count into `target`, resources/rules into `notes`, and their daily/weekly routine items as habits. Then confirm what you stored.
@@ -166,6 +209,20 @@ def _complete(**kwargs):
 
 
 def handle_message(telegram_id: int, text: str, history: list[dict]) -> str:
+    """One user turn, plus the memory write that makes the next one better."""
+    reply = _run_turn(telegram_id, text, history)
+    # Embed what was said so it's findable by meaning months later. Wrapped
+    # tight: a memory failure must never cost the user their reply.
+    try:
+        memory.remember(telegram_id, text)
+        if reply and len(reply) >= 200:
+            memory.remember(telegram_id, f"(my answer) {reply[:1500]}")
+    except Exception:  # noqa: BLE001
+        pass
+    return reply
+
+
+def _run_turn(telegram_id: int, text: str, history: list[dict]) -> str:
     """Run one user turn. `history` is the prior [{'role','content'}, ...] for context."""
     # Record the exact user text for this turn (audit + money cross-check).
     tools.set_current_message(text)
@@ -210,13 +267,28 @@ def handle_message(telegram_id: int, text: str, history: list[dict]) -> str:
         # Record the assistant's tool-call request, then run each tool.
         messages.append(msg.model_dump(exclude_none=True))
         for call in msg.tool_calls:
-            fn = tools.TOOLS.get(call.function.name)
+            name = call.function.name
+            fn = tools.TOOLS.get(name)
+            snapshot = None
             try:
                 args = json.loads(call.function.arguments or "{}")
+                # Photograph the plan BEFORE a mutating tool touches it, so the
+                # change can be reversed on command later.
+                if name in MUTATING:
+                    try:
+                        snapshot = json.dumps(db.snapshot_user(telegram_id))
+                    except Exception:  # noqa: BLE001 — undo is a nicety, never a blocker
+                        snapshot = None
                 # telegram_id is injected here — NOT taken from the model.
-                result = fn(telegram_id, **args) if fn else f"Unknown tool {call.function.name}"
+                result = fn(telegram_id, **args) if fn else f"Unknown tool {name}"
+                if snapshot and not str(result).startswith("Error running"):
+                    try:
+                        db.log_action(telegram_id, name, _summarise(name, args),
+                                      snapshot, config.UNDO_HISTORY)
+                    except Exception:  # noqa: BLE001
+                        pass
             except Exception as e:  # noqa: BLE001 — surface tool errors to the model
-                result = f"Error running {call.function.name}: {e}"
+                result = f"Error running {name}: {e}"
             messages.append({
                 "role": "tool",
                 "tool_call_id": call.id,

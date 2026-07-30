@@ -228,6 +228,46 @@ class Secret(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class MemoryVector(Base):
+    """One embedded piece of this user's history, for meaning-based recall.
+
+    Keyword search misses "what did I decide about caching" when the message
+    said "Redis cache-aside". The vector doesn't.
+    """
+    __tablename__ = "memory_vectors"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    telegram_id: Mapped[int] = mapped_column(
+        ForeignKey("users.telegram_id"), index=True, nullable=False
+    )
+    kind: Mapped[str] = mapped_column(String(12), default="turn", index=True)  # turn | fact | plan
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    # JSON array of floats. SQLite has no vector type and a few thousand short
+    # vectors scan in milliseconds, so a real vector DB would be overkill here.
+    vector: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ActionLog(Base):
+    """An undo point: what changed, and the state of the plan just before it.
+
+    Snapshot-based on purpose — one implementation reverses every tool that
+    touches the plan, instead of hand-writing an inverse for each one and
+    getting a few of them subtly wrong.
+    """
+    __tablename__ = "action_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    telegram_id: Mapped[int] = mapped_column(
+        ForeignKey("users.telegram_id"), index=True, nullable=False
+    )
+    tool: Mapped[str] = mapped_column(String(40))
+    summary: Mapped[Optional[str]] = mapped_column(Text)     # human-readable, for "what changed?"
+    snapshot: Mapped[str] = mapped_column(Text)              # JSON: plan + reminders + profile BEFORE
+    undone: Mapped[bool] = mapped_column(default=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
 class Account(Base):
     """A bill / card the user tracks: when its statement arrives and when it's due."""
     __tablename__ = "accounts"
@@ -951,7 +991,15 @@ def set_task_status(telegram_id: int, task_id: int, status: str) -> "Task | None
 
 def update_task(telegram_id: int, task_id: int, title: str | None = None,
                 notes: str | None = None, priority: int | None = None,
-                due_at: datetime | None = None, clear_due: bool = False) -> "Task | None":
+                due_at: datetime | None = None, clear_due: bool = False,
+                gate: str | None = None, target: int | None = None,
+                progress: int | None = None, recur: str | None = None,
+                status: str | None = None) -> "Task | None":
+    """Change any editable field of a task or plan node. Only what's passed moves.
+
+    The plan fields (gate/target/progress/recur/status) are here too, so a phase
+    can be corrected in place instead of the whole track being re-sent.
+    """
     with session() as s:
         t = s.get(Task, task_id)
         if t is None or t.telegram_id != telegram_id:   # ownership check
@@ -966,6 +1014,17 @@ def update_task(telegram_id: int, task_id: int, title: str | None = None,
             t.due_at = None
         elif due_at is not None:
             t.due_at = due_at
+        if gate is not None:
+            t.gate = gate.strip() or None
+        if target is not None:
+            t.target = max(0, int(target)) or None
+        if progress is not None:
+            t.progress = max(0, int(progress))
+        if recur is not None:
+            t.recur = recur.strip() or None
+        if status in ("open", "done", "dropped"):
+            t.status = status
+            t.done_at = datetime.utcnow() if status == "done" else None
         s.commit()
         s.refresh(t)          # commit expires the attributes — reload before detaching
         s.expunge(t)
@@ -1121,6 +1180,182 @@ def open_leaves(telegram_id: int, track: str | None = None, limit: int = 200) ->
         for r in leaves:
             s.expunge(r)
         return leaves
+
+
+# --- Semantic memory --------------------------------------------------------
+_MEM_FIELDS = ("id", "kind", "text", "vector", "created_at")
+
+
+def add_memory(telegram_id: int, kind: str, text: str, vector_json: str) -> int:
+    with session() as s:
+        m = MemoryVector(telegram_id=telegram_id, kind=kind, text=text,
+                         vector=vector_json)
+        s.add(m)
+        s.commit()
+        return m.id
+
+
+def memory_exists(telegram_id: int, text: str) -> bool:
+    """Don't embed the same line twice (re-sent messages, retries)."""
+    with session() as s:
+        return s.scalar(select(MemoryVector.id).where(
+            MemoryVector.telegram_id == telegram_id,
+            MemoryVector.text == text).limit(1)) is not None
+
+
+def all_memories(telegram_id: int, limit: int = 4000) -> list[dict]:
+    """This user's vectors only — never anyone else's."""
+    with session() as s:
+        rows = s.scalars(select(MemoryVector).where(
+            MemoryVector.telegram_id == telegram_id).order_by(
+            MemoryVector.id.desc()).limit(limit)).all()
+        return [{"id": r.id, "kind": r.kind, "text": r.text,
+                 "vector": r.vector, "when": r.created_at} for r in rows]
+
+
+def count_memories(telegram_id: int) -> int:
+    with session() as s:
+        return len(list(s.scalars(select(MemoryVector.id).where(
+            MemoryVector.telegram_id == telegram_id)).all()))
+
+
+# --- Undo journal -----------------------------------------------------------
+def snapshot_user(telegram_id: int) -> dict:
+    """Everything reversible for this user: plan tree, reminders, profile.
+
+    Money is deliberately excluded — transactions already have their own undo,
+    and silently rolling accounting back inside a plan undo would be dangerous.
+    """
+    with session() as s:
+        tasks = s.scalars(select(Task).where(
+            Task.telegram_id == telegram_id)).all()
+        rems = s.scalars(select(Reminder).where(
+            Reminder.telegram_id == telegram_id)).all()
+        u = s.get(User, telegram_id)
+        return {
+            "tasks": [{c.name: _iso(getattr(t, c.name))
+                       for c in Task.__table__.columns} for t in tasks],
+            "reminders": [{c.name: _iso(getattr(r, c.name))
+                           for c in Reminder.__table__.columns} for r in rems],
+            "profile": u.profile if u else None,
+        }
+
+
+def _iso(v):
+    return v.isoformat() if isinstance(v, datetime) else v
+
+
+def _unwrap(model, row: dict) -> dict:
+    """Turn stored ISO strings back into datetimes for the columns that need it."""
+    out = {}
+    for c in model.__table__.columns:
+        v = row.get(c.name)
+        if isinstance(v, str) and isinstance(c.type, DateTime):
+            try:
+                v = datetime.fromisoformat(v)
+            except ValueError:
+                v = None
+        out[c.name] = v
+    return out
+
+
+def restore_user(telegram_id: int, snap: dict) -> tuple[int, int]:
+    """Put the plan + reminders + profile back exactly as the snapshot had them.
+
+    Rows are re-inserted with their ORIGINAL ids, so parent_id links inside the
+    plan tree still point at the right nodes after a restore.
+    """
+    with session() as s:
+        for row in s.scalars(select(Task).where(
+                Task.telegram_id == telegram_id)).all():
+            s.delete(row)
+        for row in s.scalars(select(Reminder).where(
+                Reminder.telegram_id == telegram_id)).all():
+            s.delete(row)
+        s.flush()
+        for row in snap.get("tasks") or []:
+            s.add(Task(**_unwrap(Task, row)))
+        for row in snap.get("reminders") or []:
+            s.add(Reminder(**_unwrap(Reminder, row)))
+        u = s.get(User, telegram_id)
+        if u:
+            u.profile = snap.get("profile")
+        s.commit()
+        return len(snap.get("tasks") or []), len(snap.get("reminders") or [])
+
+
+def log_action(telegram_id: int, tool: str, summary: str, snapshot_json: str,
+               keep: int = 20) -> int:
+    """Record an undo point and trim the oldest beyond `keep`."""
+    with session() as s:
+        a = ActionLog(telegram_id=telegram_id, tool=tool, summary=summary,
+                      snapshot=snapshot_json)
+        s.add(a)
+        s.commit()
+        new_id = a.id
+        old = s.scalars(select(ActionLog).where(
+            ActionLog.telegram_id == telegram_id).order_by(
+            ActionLog.id.desc()).offset(max(1, keep))).all()
+        for row in old:
+            s.delete(row)
+        s.commit()
+        return new_id
+
+
+def recent_actions(telegram_id: int, limit: int = 10,
+                   only_undoable: bool = False) -> list["ActionLog"]:
+    with session() as s:
+        stmt = select(ActionLog).where(ActionLog.telegram_id == telegram_id)
+        if only_undoable:
+            stmt = stmt.where(ActionLog.undone == False)   # noqa: E712
+        rows = s.scalars(stmt.order_by(ActionLog.id.desc()).limit(limit)).all()
+        for r in rows:
+            s.expunge(r)
+        return list(rows)
+
+
+def mark_undone(telegram_id: int, action_id: int) -> bool:
+    with session() as s:
+        a = s.get(ActionLog, action_id)
+        if a is None or a.telegram_id != telegram_id:      # ownership check
+            return False
+        a.undone = True
+        s.commit()
+        return True
+
+
+def find_nodes(telegram_id: int, text: str, kinds: tuple[str, ...] | None = None,
+               include_done: bool = True) -> list["Task"]:
+    """Match ANY plan node by words from its title — phases and habits included.
+
+    find_tasks() only looks at open leaf work, so a finished phase or a track was
+    impossible to point at. This is what "edit the DSA P3 gate" resolves through.
+    """
+    needle = (text or "").strip().lower()
+    if not needle:
+        return []
+    with session() as s:
+        stmt = select(Task).where(Task.telegram_id == telegram_id)
+        if kinds:
+            stmt = stmt.where(Task.kind.in_(kinds))
+        if not include_done:
+            stmt = stmt.where(Task.status == "open")
+        rows = list(s.scalars(stmt.order_by(Task.order_idx, Task.id)).all())
+        hits = [r for r in rows if needle in (r.title or "").lower()]
+        # Nothing matched whole — try every word, so "P3 gate" finds "P3 Stack".
+        if not hits:
+            words = [w for w in needle.split() if len(w) > 1]
+            hits = [r for r in rows
+                    if words and all(w in (r.title or "").lower() for w in words)]
+        for r in hits:
+            s.expunge(r)
+        return hits
+
+
+def next_order_idx(telegram_id: int, parent_id: int | None) -> int:
+    """Where a newly appended child belongs — after the ones already there."""
+    kids = children(telegram_id, parent_id)
+    return (max((k.order_idx or 0) for k in kids) + 1) if kids else 0
 
 
 def delete_subtree(telegram_id: int, node_id: int) -> int:
