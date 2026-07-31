@@ -34,12 +34,16 @@ print("\n1. Daily routine goes in cleanly (no false clashes)")
 for t, txt in [("07:30", "DSA 1 hour"), ("20:30", "Calisthenics"),
                ("21:45", "Dev phase work"), ("23:40", "Philosophy")]:
     out = tools.set_reminder(UID, txt, f"{TOMORROW}T{t}:00", "daily")
-    check(f"{t} {txt} set with no false clash", "Heads up" not in out, out[-90:])
+    check(f"{t} {txt} set with no false clash", "CLASH" not in out, out[-90:])
 
 print("\n2. A real clash is caught when adding")
 out = tools.set_reminder(UID, "Client call", f"{TOMORROW}T21:50:00", "daily")
-check("clash detected on insert", "Heads up" in out and "Dev phase" in out, out[-120:])
+check("clash detected on insert", "CLASH" in out and "Dev phase" in out, out[-120:])
 check("gap distance reported", "5 min away" in out, out[-120:])
+# The model must be told to relay it — in production it replied "done" and
+# dropped the warning entirely, which is how this was caught.
+check("tool result orders the model to report it",
+      "REPORT THIS TO THE USER" in out, out[-160:])
 
 print("\n3. check_time_free before promising")
 busy = tools.check_time_free(UID, f"{TOMORROW}T07:45:00", "daily")

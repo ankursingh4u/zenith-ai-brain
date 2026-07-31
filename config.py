@@ -47,6 +47,13 @@ VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o").strip()
 # keyword search instead of breaking — see brain/memory.py.
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small").strip()
 EMBED_ENABLED = os.getenv("EMBED_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+# Embeddings may live on a DIFFERENT provider than chat. A gateway that serves
+# chat perfectly can still refuse embeddings — llms.codershive.in returns
+# 400 "No credentials for embedding". Set EMBED_API_KEY to an OpenAI key (and
+# leave EMBED_BASE_URL empty for api.openai.com) and chat keeps using the
+# gateway while embeddings go direct. Unset = use the same client as chat.
+EMBED_BASE_URL = os.getenv("EMBED_BASE_URL", "").strip()
+EMBED_API_KEY = os.getenv("EMBED_API_KEY", "").strip()
 # How many past items the semantic search may consider. Cosine over a few
 # thousand short vectors in Python is milliseconds; this is just a sanity cap.
 MEMORY_SCAN_LIMIT = int(os.getenv("MEMORY_SCAN_LIMIT", "4000"))

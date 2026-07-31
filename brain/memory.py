@@ -27,6 +27,31 @@ _available: bool | None = None
 _MIN_CHARS = 25
 
 
+_client = None
+
+
+def client():
+    """The embeddings client — its own provider if configured, else chat's.
+
+    Chat and embeddings are separate capabilities: a gateway can serve one and
+    refuse the other (llms.codershive.in answers chat fine but returns 400
+    "No credentials for embedding"), so these may point at different places.
+    """
+    global _client
+    if _client is None:
+        if config.EMBED_API_KEY or config.EMBED_BASE_URL:
+            from openai import OpenAI
+            kwargs = {"api_key": config.EMBED_API_KEY or config.LLM_API_KEY}
+            if config.EMBED_BASE_URL:
+                kwargs["base_url"] = config.EMBED_BASE_URL
+            _client = OpenAI(**kwargs)
+            log.info("Embeddings use their own endpoint: %s",
+                     config.EMBED_BASE_URL or "api.openai.com")
+        else:
+            _client = llm.client()
+    return _client
+
+
 def available() -> bool:
     return bool(config.EMBED_ENABLED) and _available is not False
 
@@ -37,7 +62,7 @@ def _embed(text: str) -> list[float] | None:
     if not available():
         return None
     try:
-        resp = llm.client().embeddings.create(
+        resp = client().embeddings.create(
             model=config.EMBED_MODEL, input=text[:8000])
         vec = list(resp.data[0].embedding)
         if _available is not True:

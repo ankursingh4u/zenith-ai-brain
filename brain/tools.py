@@ -466,13 +466,17 @@ def set_reminder(telegram_id: int, text: str, when_iso: str,
     out = f"⏰ Reminder set for {when}: {text}"
     if hits:
         # Set anyway — the user's time is theirs — but never silently double-book.
-        out += (f"\n\n⚠️ Heads up, this sits on top of {len(hits)} existing block(s):\n"
+        # The instruction lives in the TOOL RESULT, not only in the system
+        # prompt: a summarising model otherwise replies "done, reminder set"
+        # and silently drops the warning, which defeats detecting it at all.
+        out += (f"\n\n⚠️ CLASH — REPORT THIS TO THE USER. Do not answer with just "
+                f"'done'. This sits on top of {len(hits)} existing block(s):\n"
                 + "\n".join(
                     f"• {o_local:%H:%M}"
                     + (f" 🔁 {o.repeat}" if getattr(o, "repeat", None) else "")
                     + f" — {o.text} ({gap} min away)"
                     for gap, o, o_local in hits[:4])
-                + "\nTell me if you want either one moved.")
+                + "\nName what it collides with, then offer to move either one.")
     return out
 
 
