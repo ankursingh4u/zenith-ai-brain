@@ -11,14 +11,25 @@ pypdf==5.0.1                     # extract text from statement PDFs
 price-parser==0.3.4              # deterministic money-amount extraction (cross-check the AI)
 
 # --- Web access + matching (free, keyless, small) ---
-# NOTE: ddgs DECLARES httpx>=0.28, but it actually makes its requests through
-# `primp`, so it runs fine on the httpx 0.27.2 pin above. Do NOT let pip
-# "resolve" that conflict by upgrading httpx — 0.28 breaks openai 1.54 with
-# "Client.__init__() got an unexpected keyword argument 'proxies'", which kills
-# every reply. Install with: pip install -r requirements.txt && pip install httpx==0.27.2
-ddgs==9.14.4                     # DuckDuckGo search — no API key, no quota
 trafilatura==2.1.0               # HTML -> readable article text (drops nav/ads)
 rapidfuzz==3.14.5                # approximate title matching (~1MB, C++)
+
+# ddgs (DuckDuckGo search) is deliberately NOT listed here. It DECLARES
+# httpx>=0.28.1, but httpx 0.28 is impossible for us: python-telegram-bot 21.6
+# pins httpx~=0.27, and openai 1.54 breaks on 0.28 with "Client.__init__() got
+# an unexpected keyword argument 'proxies'" — every reply dies. Listing ddgs
+# here makes pip see both constraints at once and fail with
+# ResolutionImpossible, which is exactly how the 2026-07-31 build broke.
+# The Dockerfile installs it with --no-deps instead, and these are its real
+# runtime deps. ddgs makes its actual requests through primp and works fine on
+# httpx 0.27.2 (verified with a live search).
+click==8.4.2
+fake-useragent==2.2.0
+primp==1.3.1
+lxml==6.1.1
+h2==4.4.0                        # ddgs' duckduckgo engine imports h2 directly
+hpack==4.2.0
+hyperframe==6.1.0
 
 # --- Google login callback server ---
 fastapi==0.115.2
