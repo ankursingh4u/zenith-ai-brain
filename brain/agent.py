@@ -127,6 +127,7 @@ SHEETS WITH MANY TABS — this is normal, handle it, never refuse:
 - One spreadsheet usually has several tabs (e.g. EXPENSES, BILL PAYMENTS, BANK TRANSFER, SWIPE, DEPOSITE), each with its own columns (DATE, ACCOUNT, TRANSFER TO, AMOUNT, TRANSFER FROM, REASON, PAYMENT MODE, EMP_NAME, IMAGES).
 - When the user names a tab ("in the Expense tab") or the entry needs specific columns: call sheet_structure to see the real tabs/columns, then call add_sheet_row with the tab and a fields object keyed by that tab's REAL column names. Fill every column you can from what the user told you; leave unknown ones out.
 - Do this in ONE go. Do not ask which tab if the user already said it, and do not answer with what you "would" do — call the tools and report the result.
+- MATCH THE SHEET'S OWN CONVENTIONS. Before writing, look at how existing rows are written and follow them: the same date format (day-first here), amounts as plain numbers with no currency symbol and no comma grouping so the sheet can still sum them, and the same wording for things like payment mode. A row that looks different from the ones above it is a row someone has to fix by hand later.
 - If the tab name doesn't exist, say which tabs DO exist and ask them to pick — that is the only time to ask.
 - switch_sheet changes which connected sheet is the default. That is allowed and is NOT a deletion — just do it when asked.
 - To put a screenshot/receipt link in an IMAGES column, call upload_image_to_drive (returns a public 'anyone with the link' URL) and pass that URL as the IMAGES value in the same add_sheet_row call.
@@ -252,6 +253,26 @@ def _run_turn(telegram_id: int, text: str, history: list[dict]) -> str:
     sys = SYSTEM_PROMPT + who + plan_ctx + (
         f"\nCURRENT TIME: {now:%A %d %B %Y, %H:%M} ({config.TIMEZONE}). "
         f"Use this for all relative times ('tomorrow', 'in 2 hours', 'next Monday')."
+        f"\n\nWHERE THEY ARE: {config.COUNTRY}, timezone {config.TIMEZONE}. "
+        f"Every time you say or store is local time here — never UTC, and never "
+        f"a US reading of anything.\n"
+        f"- Dates are DAY FIRST ({config.DATE_ORDER}). 03-04 is 3 April, not 4 March. "
+        f"Write dates back as {config.DATE_ORDER} too, including into their Sheet.\n"
+        f"- Money is {config.CURRENCY} ({config.CURRENCY_SYMBOL}). 'lakh' = 100000, "
+        f"'crore' = 10000000, '50k' = 50000. Convert to a plain number before "
+        f"logging: '2.5 lakh' is 250000. Indian grouping (2,00,000) is normal and "
+        f"means 200000. Write plain numbers into the Sheet, no symbol or commas.\n"
+        f"- Hinglish time words are normal: subah = morning, dopahar = afternoon, "
+        f"shaam = evening, raat = night, kal = tomorrow OR yesterday (decide from "
+        f"tense), parso = day after tomorrow / day before yesterday, aaj = today.\n"
+        f"- A BARE HOUR IS AMBIGUOUS AND YOU MUST NOT GUESS SILENTLY. '7:30' could "
+        f"be either. Work it out from the activity and their known routine — a "
+        f"study block or gym before office is morning, dinner or a call is "
+        f"evening — then ALWAYS echo back what you set in full ('7:30 AM "
+        f"tomorrow') so a wrong reading is obvious. If you genuinely cannot tell, "
+        f"ask one short question instead of picking.\n"
+        f"- The week starts Monday. The financial year runs April to March. "
+        f"Business hours and 'end of day' mean {config.TIMEZONE}."
     )
     messages = [{"role": "system", "content": sys}, *history,
                 {"role": "user", "content": text}]

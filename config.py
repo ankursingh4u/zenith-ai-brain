@@ -64,6 +64,15 @@ UNDO_HISTORY = int(os.getenv("UNDO_HISTORY", "20"))
 # list — see scheduler/jobs.evening_checkin.
 CHECKIN_HOUR = int(os.getenv("CHECKIN_HOUR", "21"))
 
+# --- Where the user actually lives -----------------------------------------
+# Drives how times, dates, money and number words are read. Wrong defaults here
+# are silent and expensive: "2 lakh" logged as 2, or 03-04 read as 4 March.
+COUNTRY = os.getenv("COUNTRY", "India").strip()
+CURRENCY = os.getenv("CURRENCY", "INR").strip()
+CURRENCY_SYMBOL = os.getenv("CURRENCY_SYMBOL", "₹").strip()
+# Day-first, like the rest of the world outside the US.
+DATE_ORDER = os.getenv("DATE_ORDER", "DD-MM-YYYY").strip()
+
 # --- Voice (speech-to-text + text-to-speech) ---
 STT_MODEL = os.getenv("STT_MODEL", "whisper-1").strip()        # transcription
 # Force a transcription language (e.g. "hi" or "en"); empty = auto-detect.

@@ -20,6 +20,7 @@ SUITES = [
     ("web access + fuzzy", "test_web_fuzzy.py"),
     ("encryption key rotation", "test_key_rotation.py"),
     ("check-in / chasing", "test_checkin.py"),
+    ("India locale + money", "test_locale_money.py"),
 ]
 
 
