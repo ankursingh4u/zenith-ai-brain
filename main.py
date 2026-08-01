@@ -39,6 +39,11 @@ def main() -> None:
              config.LLM_BASE_URL or "api.openai.com (default)",
              config.OPENAI_MODEL, config.VISION_MODEL, config.FAST_MODEL)
 
+    # Answer the embeddings question here, not the first time someone happens
+    # to type something — a wrong key otherwise looks exactly like an idle bot.
+    from brain import memory
+    memory.selftest()
+
     if gservice.is_configured():
         log.info("Google service account ready: %s", gservice.service_account_email())
     else:

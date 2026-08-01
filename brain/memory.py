@@ -77,6 +77,27 @@ def _embed(text: str) -> list[float] | None:
         return None
 
 
+def selftest() -> bool:
+    """Settle at startup whether embeddings work here, and say so in the log.
+
+    Otherwise the answer only appears the first time a user happens to send a
+    message, which means a misconfigured key looks identical to an idle bot.
+    One tiny embedding at boot costs a fraction of a cent and removes the doubt.
+    """
+    if not config.EMBED_ENABLED:
+        log.info("Semantic memory disabled by config (EMBED_ENABLED=0).")
+        return False
+    vec = _embed("startup check")
+    if vec is None:
+        log.warning("Semantic memory OFF — recall will use keyword search.")
+        return False
+    log.info("Semantic memory ON (model=%s, dim=%d, endpoint=%s).",
+             config.EMBED_MODEL, len(vec),
+             config.EMBED_BASE_URL or ("api.openai.com" if config.EMBED_API_KEY
+                                       else config.LLM_BASE_URL or "api.openai.com"))
+    return True
+
+
 def remember(telegram_id: int, text: str, kind: str = "turn") -> bool:
     """Embed and store one line of history. Safe to call on every message."""
     text = (text or "").strip()
