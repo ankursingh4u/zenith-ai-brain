@@ -228,12 +228,65 @@ def handle_message(telegram_id: int, text: str, history: list[dict]) -> str:
     return reply
 
 
+def _place_block(telegram_id: int) -> str:
+    """Time, date and money conventions for THIS user — never a global default.
+
+    This bot serves several people who do not live in the same place. Baking one
+    country into the prompt tells a user in Berlin that their money is rupees and
+    their 03-04 is 3 April. So the settings are per-user, the server value is
+    only a fallback, and when we have not been told we say so and ask.
+    """
+    loc = db.get_locale(telegram_id)
+    tz = ZoneInfo(loc["timezone"])
+    now = datetime.now(tz)
+    india = loc["country"].strip().lower() == "india" or loc["currency"] == "INR"
+
+    out = (
+        f"\nCURRENT TIME: {now:%A %d %B %Y, %H:%M} ({loc['timezone']}). "
+        f"Use this for all relative times ('tomorrow', 'in 2 hours', 'next Monday')."
+        f"\n\nWHERE THIS USER IS: {loc['country']}, timezone {loc['timezone']}, "
+        f"money in {loc['currency']}. Every time you say or store is THEIR local "
+        f"time — never UTC, and never another country's reading of a date.\n"
+    )
+    if not loc["known"]:
+        out += ("- You have NOT been told where they are; the above is only the "
+                "server default. If a time or date actually matters, ask them "
+                "once ('which city are you in?') and save it with set_my_place. "
+                "Don't interrogate them, and don't assume they're in the same "
+                "country as anyone else.\n")
+    out += (
+        "- Dates are DAY FIRST unless they clearly write otherwise: 03-04 is "
+        "3 April, not 4 March. Write dates back the same way, including into "
+        "their Sheet.\n"
+        "- A BARE HOUR IS AMBIGUOUS AND YOU MUST NOT GUESS SILENTLY. '7:30' "
+        "could be either. Work it out from the activity and their known routine "
+        "— a study block or gym before work is morning, dinner or a call is "
+        "evening — then ALWAYS echo back what you set in full ('7:30 AM "
+        "tomorrow') so a wrong reading is obvious. If you genuinely cannot tell, "
+        "ask one short question instead of picking.\n"
+    )
+    if india:
+        out += (
+            "- Money words here: 'lakh' = 100000, 'crore' = 10000000, "
+            "'50k' = 50000. Convert to a plain number before logging — "
+            "'2.5 lakh' is 250000. Grouping like 2,00,000 means 200000. Write "
+            "plain numbers into the Sheet, no symbol or commas, so it can sum.\n"
+            "- Hinglish time words are normal: subah = morning, dopahar = "
+            "afternoon, shaam = evening, raat = night, kal = tomorrow OR "
+            "yesterday (decide from tense), parso = either side of that, "
+            "aaj = today.\n"
+            "- Week starts Monday. Financial year is April to March."
+        )
+    else:
+        out += ("- Write plain numbers into their Sheet, no currency symbol or "
+                "thousands separators, so the column can still sum.")
+    return out
+
+
 def _run_turn(telegram_id: int, text: str, history: list[dict]) -> str:
     """Run one user turn. `history` is the prior [{'role','content'}, ...] for context."""
     # Record the exact user text for this turn (audit + money cross-check).
     tools.set_current_message(text)
-
-    now = datetime.now(_TZ)
     profile = db.get_profile(telegram_id)
     who = (
         f"\n\nYOUR USER (their own words — adapt to this, assume nothing else):\n{profile}"
@@ -250,30 +303,7 @@ def _run_turn(telegram_id: int, text: str, history: list[dict]) -> str:
         "log_progress/check_habit/complete_task to record what they report."
         if snapshot else ""
     )
-    sys = SYSTEM_PROMPT + who + plan_ctx + (
-        f"\nCURRENT TIME: {now:%A %d %B %Y, %H:%M} ({config.TIMEZONE}). "
-        f"Use this for all relative times ('tomorrow', 'in 2 hours', 'next Monday')."
-        f"\n\nWHERE THEY ARE: {config.COUNTRY}, timezone {config.TIMEZONE}. "
-        f"Every time you say or store is local time here — never UTC, and never "
-        f"a US reading of anything.\n"
-        f"- Dates are DAY FIRST ({config.DATE_ORDER}). 03-04 is 3 April, not 4 March. "
-        f"Write dates back as {config.DATE_ORDER} too, including into their Sheet.\n"
-        f"- Money is {config.CURRENCY} ({config.CURRENCY_SYMBOL}). 'lakh' = 100000, "
-        f"'crore' = 10000000, '50k' = 50000. Convert to a plain number before "
-        f"logging: '2.5 lakh' is 250000. Indian grouping (2,00,000) is normal and "
-        f"means 200000. Write plain numbers into the Sheet, no symbol or commas.\n"
-        f"- Hinglish time words are normal: subah = morning, dopahar = afternoon, "
-        f"shaam = evening, raat = night, kal = tomorrow OR yesterday (decide from "
-        f"tense), parso = day after tomorrow / day before yesterday, aaj = today.\n"
-        f"- A BARE HOUR IS AMBIGUOUS AND YOU MUST NOT GUESS SILENTLY. '7:30' could "
-        f"be either. Work it out from the activity and their known routine — a "
-        f"study block or gym before office is morning, dinner or a call is "
-        f"evening — then ALWAYS echo back what you set in full ('7:30 AM "
-        f"tomorrow') so a wrong reading is obvious. If you genuinely cannot tell, "
-        f"ask one short question instead of picking.\n"
-        f"- The week starts Monday. The financial year runs April to March. "
-        f"Business hours and 'end of day' mean {config.TIMEZONE}."
-    )
+    sys = SYSTEM_PROMPT + who + plan_ctx + _place_block(telegram_id)
     messages = [{"role": "system", "content": sys}, *history,
                 {"role": "user", "content": text}]
 

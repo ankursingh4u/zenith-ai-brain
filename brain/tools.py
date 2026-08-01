@@ -63,7 +63,22 @@ def _resolve_account(telegram_id: int, account: str | None) -> tuple[str | None,
                   + "\n".join(f"• {a.email}" for a in accts)
                   + "\nWhich one should I use? (Tip: set a default in /connect so I stop asking.)")
 
-_TZ = ZoneInfo(config.TIMEZONE)
+_DEFAULT_TZ = ZoneInfo(config.TIMEZONE)
+
+
+def _tz(telegram_id: int | None = None) -> ZoneInfo:
+    """THIS user's timezone. The config value is only a fallback, never a claim.
+
+    Every user of this bot can live somewhere different, so "7am" has to mean
+    7am where they are. A single module-level timezone silently gave everyone
+    the server's clock.
+    """
+    if telegram_id is None:
+        return _DEFAULT_TZ
+    try:
+        return ZoneInfo(db.get_locale(telegram_id)["timezone"])
+    except Exception:  # noqa: BLE001 — an unknown tz must not break the turn
+        return _DEFAULT_TZ
 _UTC = ZoneInfo("UTC")
 
 # The exact text the user typed this turn — for audit + amount cross-check.
@@ -211,9 +226,9 @@ _REPEATS = {"daily", "weekdays", "weekends", "weekly"}
 _WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 
-def _rem_local(r):
-    """A stored reminder's time in the user's own timezone."""
-    return r.due_at.replace(tzinfo=_UTC).astimezone(_TZ)
+def _rem_local(r, tz=None):
+    """A stored reminder's time in the owning user's timezone."""
+    return r.due_at.replace(tzinfo=_UTC).astimezone(tz or _DEFAULT_TZ)
 
 
 def _repeat_days(local, repeat: str | None) -> set[int] | None:
@@ -250,11 +265,12 @@ def _clashes(telegram_id: int, local, repeat: str | None, window_min: int = 30,
     clash, but it must never have to guess whether one exists.
     """
     out = []
+    tz = _tz(telegram_id)
     mins = local.hour * 60 + local.minute
     for r in db.list_reminders(telegram_id):
         if skip_id is not None and r.id == skip_id:
             continue
-        r_local = _rem_local(r)
+        r_local = _rem_local(r, tz)
         if not _can_share_a_day(local, repeat, r_local, getattr(r, "repeat", None)):
             continue
         r_mins = r_local.hour * 60 + r_local.minute
@@ -273,7 +289,7 @@ def check_time_free(telegram_id: int, when_iso: str, repeat: str | None = None,
     except ValueError:
         return "I couldn't read that time. Give it as 2026-07-31T19:30:00."
     if local.tzinfo is None:
-        local = local.replace(tzinfo=_TZ)
+        local = local.replace(tzinfo=_tz(telegram_id))
     hits = _clashes(telegram_id, local, repeat, int(window_min or 30))
     if not hits:
         return (f"✅ {local:%H:%M} looks free — nothing else within "
@@ -293,7 +309,8 @@ def day_plan(telegram_id: int, day: str = "today") -> str:
     This is what makes 'where does 2 hours of dev actually fit?' answerable
     instead of guessed.
     """
-    now_local = datetime.now(_TZ)
+    tz = _tz(telegram_id)
+    now_local = datetime.now(tz)
     want = (day or "today").strip().lower()
     target = now_local.date()
     if want == "tomorrow":
@@ -307,7 +324,7 @@ def day_plan(telegram_id: int, day: str = "today") -> str:
 
     rows = []
     for r in db.list_reminders(telegram_id):
-        r_local = _rem_local(r)
+        r_local = _rem_local(r, tz)
         days = _repeat_days(r_local, getattr(r, "repeat", None))
         fires = (r_local.date() == target) if days is None else (target.weekday() in days)
         if fires:
@@ -333,7 +350,8 @@ def plan_gaps(telegram_id: int) -> str:
     Structural problems are found here in code so the assistant reports facts
     rather than an impression.
     """
-    now_local = datetime.now(_TZ)
+    tz = _tz(telegram_id)
+    now_local = datetime.now(tz)
     now_utc = now_local.astimezone(_UTC).replace(tzinfo=None)
     problems: list[str] = []
 
@@ -411,7 +429,7 @@ def plan_gaps(telegram_id: int) -> str:
     reported: set[frozenset] = set()
     clash_lines = []
     for r in reminders:
-        r_local = _rem_local(r)
+        r_local = _rem_local(r, tz)
         # Tighter than the insert warning: back-to-back blocks 20 minutes apart
         # are a routine, not a conflict. Only real overlaps belong in an audit.
         for gap, other, o_local in _clashes(
@@ -437,7 +455,7 @@ def set_reminder(telegram_id: int, text: str, when_iso: str,
     """when_iso is a local-time ISO datetime. `repeat` makes it recur."""
     local = datetime.fromisoformat(when_iso)
     if local.tzinfo is None:
-        local = local.replace(tzinfo=_TZ)
+        local = local.replace(tzinfo=_tz(telegram_id))
     repeat = (repeat or "").strip().lower() or None
     if repeat and repeat not in _REPEATS:
         repeat = "daily" if "day" in repeat else "weekly"
@@ -445,7 +463,7 @@ def set_reminder(telegram_id: int, text: str, when_iso: str,
     if repeat:
         from datetime import timedelta
         step = timedelta(weeks=1) if repeat == "weekly" else timedelta(days=1)
-        while local <= datetime.now(_TZ):
+        while local <= datetime.now(_tz(telegram_id)):
             local += step
         if repeat == "weekdays":
             while local.weekday() >= 5:
@@ -484,9 +502,10 @@ def list_reminders(telegram_id: int) -> str:
     rows = db.list_reminders(telegram_id)
     if not rows:
         return "No pending reminders."
+    tz = _tz(telegram_id)
     lines = []
     for r in rows:
-        local = r.due_at.replace(tzinfo=_UTC).astimezone(_TZ)
+        local = r.due_at.replace(tzinfo=_UTC).astimezone(tz)
         every = f" 🔁 {r.repeat}" if getattr(r, "repeat", None) else ""
         lines.append(f"#{r.id} — {local:%a %d %b, %H:%M}{every}: {r.text}")
     return "Pending reminders:\n" + "\n".join(lines)
@@ -508,7 +527,8 @@ def cancel_reminder(telegram_id: int, reminder_id: int | None = None,
 _PRIORITY_LABEL = {1: "🔴", 2: "🟡", 3: "⚪"}
 
 
-def _due_utc(when_iso: str | None) -> datetime | None:
+def _due_utc(when_iso: str | None, tz=None) -> datetime | None:
+    """Local ISO -> naive UTC, using the OWNING user's timezone."""
     if not when_iso:
         return None
     try:
@@ -516,15 +536,15 @@ def _due_utc(when_iso: str | None) -> datetime | None:
     except ValueError:
         return None
     if local.tzinfo is None:
-        local = local.replace(tzinfo=_TZ)
+        local = local.replace(tzinfo=tz or _DEFAULT_TZ)
     return local.astimezone(_UTC).replace(tzinfo=None)
 
 
-def _task_line(t) -> str:
+def _task_line(t, tz=None) -> str:
     mark = _PRIORITY_LABEL.get(t.priority, "🟡")
     line = f"{mark} #{t.id} {t.title}"
     if t.due_at:
-        line += f" — due {t.due_at.replace(tzinfo=_UTC).astimezone(_TZ):%a %d %b}"
+        line += f" — due {t.due_at.replace(tzinfo=_UTC).astimezone(tz or _DEFAULT_TZ):%a %d %b}"
     if t.notes:
         line += f"\n     {t.notes}"
     return line
@@ -537,6 +557,7 @@ def add_tasks(telegram_id: int, tasks: list) -> str:
     if not tasks:
         return "No tasks given."
     added = []
+    tz = _tz(telegram_id)
     for item in tasks[:40]:
         if isinstance(item, str):
             item = {"title": item}
@@ -545,7 +566,7 @@ def add_tasks(telegram_id: int, tasks: list) -> str:
             continue
         tid = db.add_task(
             telegram_id, title, (item.get("notes") or None),
-            int(item.get("priority") or 2), _due_utc(item.get("due_iso")),
+            int(item.get("priority") or 2), _due_utc(item.get("due_iso"), tz),
         )
         added.append(f"#{tid} {title}")
     if not added:
@@ -557,7 +578,8 @@ def add_tasks(telegram_id: int, tasks: list) -> str:
 
 def list_open_tasks(telegram_id: int, when: str = "all") -> str:
     """List the user's open tasks. `when`: all | today | overdue."""
-    now_local = datetime.now(_TZ)
+    tz = _tz(telegram_id)
+    now_local = datetime.now(tz)
     cutoff = None
     if when == "today":
         end = now_local.replace(hour=23, minute=59, second=59)
@@ -616,7 +638,7 @@ def update_task(telegram_id: int, task_id: int, title: str | None = None,
                 due_iso: str | None = None) -> str:
     """Change a task's title, notes, priority or due date."""
     t = db.update_task(telegram_id, int(task_id), title, notes, priority,
-                       _due_utc(due_iso))
+                       _due_utc(due_iso, _tz(telegram_id)))
     if t is None:
         return f"No task #{task_id}."
     return "✏️ Updated:\n" + _task_line(t)
@@ -692,7 +714,7 @@ def list_recent_changes(telegram_id: int, limit: int = 8) -> str:
         return "No changes recorded yet."
     lines = []
     for i, a in enumerate(rows, 1):
-        local = a.created_at.replace(tzinfo=_UTC).astimezone(_TZ)
+        local = a.created_at.replace(tzinfo=_UTC).astimezone(_tz(telegram_id))
         mark = " (already undone)" if a.undone else ""
         lines.append(f"{i}. {local:%d %b %H:%M} — {a.summary or a.tool}{mark}")
     return ("Recent changes (newest first):\n" + "\n".join(lines)
@@ -727,7 +749,7 @@ def undo_last(telegram_id: int, steps: int = 1) -> str:
     # Everything from this point forward is now void, so it can't be re-applied.
     for a in rows[:n]:
         db.mark_undone(telegram_id, a.id)
-    local = target.created_at.replace(tzinfo=_UTC).astimezone(_TZ)
+    local = target.created_at.replace(tzinfo=_UTC).astimezone(_tz(telegram_id))
     return (f"↩️ Rolled back to before: {target.summary or target.tool} "
             f"({local:%d %b %H:%M}).\n"
             f"Your plan is restored to {tasks} item(s) and {rems} reminder(s).\n"
@@ -750,6 +772,35 @@ def remember_about_me(telegram_id: int, fact: str, replace: bool = False) -> str
         new = "\n".join(lines[-40:])          # keep the profile from growing forever
     db.set_profile(telegram_id, new)
     return f"🧠 Noted about you: {fact}"
+
+
+def set_my_place(telegram_id: int, timezone: str | None = None,
+                 country: str | None = None, currency: str | None = None,
+                 checkin_hour: int | None = None) -> str:
+    """Save where THIS user lives, so their times and money are read correctly."""
+    if timezone:
+        try:
+            ZoneInfo(timezone)
+        except Exception:  # noqa: BLE001
+            return (f"'{timezone}' isn't a timezone I know. Use an IANA name like "
+                    "Asia/Kolkata, Europe/Berlin, America/New_York, Asia/Dubai.")
+    if not db.set_locale(telegram_id, timezone, country, currency, checkin_hour):
+        return "Couldn't save that."
+    loc = db.get_locale(telegram_id)
+    now = datetime.now(ZoneInfo(loc["timezone"]))
+    return (f"📍 Saved: {loc['country']}, {loc['timezone']} "
+            f"(it's {now:%H:%M} there now), money in {loc['currency']}, "
+            f"evening check-in at {loc['checkin_hour']:02d}:00.")
+
+
+def my_place(telegram_id: int) -> str:
+    """Show the place settings currently in use for this user."""
+    loc = db.get_locale(telegram_id)
+    now = datetime.now(ZoneInfo(loc["timezone"]))
+    known = "" if loc["known"] else "  (default — you haven't told me yet)"
+    return (f"📍 {loc['country']}, {loc['timezone']}{known}\n"
+            f"Local time now: {now:%A %d %b, %H:%M}\n"
+            f"Money: {loc['currency']} · evening check-in {loc['checkin_hour']:02d}:00")
 
 
 def my_profile(telegram_id: int) -> str:
@@ -782,13 +833,14 @@ def _node_from(telegram_id: int, item: dict, parent_id: int | None,
     title = str(item.get("title") or "").strip()
     if not title:
         return 0
+    tz = _tz(telegram_id)
     kind = str(item.get("kind") or ("phase" if item.get("children") else "task")).lower()
     if kind not in ("track", "phase", "task", "habit"):
         kind = "task"
     node_id = db.add_node(
         telegram_id, title, kind, parent_id, track or item.get("track"),
         item.get("notes"), item.get("gate"), int(item.get("priority") or 2),
-        item.get("target"), item.get("recur"), idx, _due_utc(item.get("due_iso")),
+        item.get("target"), item.get("recur"), idx, _due_utc(item.get("due_iso"), tz),
     )
     made = 1
     for i, child in enumerate(item.get("children") or []):
@@ -996,7 +1048,7 @@ def edit_plan_item(telegram_id: int, item_id: int | None = None,
         return problem
     t = db.update_task(
         telegram_id, node.id, new_title, notes, priority,
-        _due_utc(due_iso), False, gate, target, progress, recur, status,
+        _due_utc(due_iso, _tz(telegram_id)), False, gate, target, progress, recur, status,
     )
     if t is None:
         return f"Couldn't update #{node.id}."
@@ -1194,7 +1246,8 @@ def plan_snapshot(telegram_id: int, max_chars: int = 2200) -> str:
 
 def what_now(telegram_id: int) -> str:
     """The single next thing to do, decided from the plan — not from memory."""
-    now_local = datetime.now(_TZ)
+    tz = _tz(telegram_id)
+    now_local = datetime.now(tz)
     now_utc = now_local.astimezone(_UTC).replace(tzinfo=None)
     lines = []
 
@@ -1263,7 +1316,7 @@ def check_habit(telegram_id: int, title: str) -> str:
     if not matches:
         names = ", ".join(h.title for h in db.habits(telegram_id)) or "none set up"
         return f"No habit matching '{title}'. Your habits: {names}."
-    now_utc = datetime.now(_TZ).astimezone(_UTC).replace(tzinfo=None)
+    now_utc = datetime.now(_tz(telegram_id)).astimezone(_UTC).replace(tzinfo=None)
     h = db.touch_habit(telegram_id, matches[0].id, now_utc)
     return f"🔁 {h.title} done. Streak: {h.streak} 🔥"
 
@@ -1419,14 +1472,14 @@ def edit_reminder(telegram_id: int, reminder_id: int | None = None,
     if when_iso:
         local = datetime.fromisoformat(when_iso)
         if local.tzinfo is None:
-            local = local.replace(tzinfo=_TZ)
+            local = local.replace(tzinfo=_tz(telegram_id))
         due = local.astimezone(_UTC).replace(tzinfo=None)
     clear = str(repeat).lower() in ("none", "off", "once", "never") if repeat else False
     r = db.update_reminder(telegram_id, int(reminder_id), text, due,
                            None if clear else repeat, clear)
     if r is None:
         return f"No reminder #{reminder_id}."
-    local = r.due_at.replace(tzinfo=_UTC).astimezone(_TZ)
+    local = r.due_at.replace(tzinfo=_UTC).astimezone(_tz(telegram_id))
     every = f" 🔁 {r.repeat}" if r.repeat else ""
     return f"✏️ Reminder #{r.id} -> {local:%a %d %b, %H:%M}{every}: {r.text}"
 
@@ -1450,7 +1503,7 @@ def list_habits(telegram_id: int) -> str:
     hs = db.habits(telegram_id)
     if not hs:
         return "No habits tracked yet. Say e.g. 'track calisthenics 4x a week'."
-    today = datetime.now(_TZ).astimezone(_UTC).replace(tzinfo=None).date()
+    today = datetime.now(_tz(telegram_id)).astimezone(_UTC).replace(tzinfo=None).date()
     out = []
     for h in hs:
         done = h.last_done_at is not None and h.last_done_at.date() == today
@@ -1838,6 +1891,8 @@ TOOLS: dict[str, callable] = {
     "reset_everything": reset_everything,
     "recall": recall,
     "remember_about_me": remember_about_me,
+    "set_my_place": set_my_place,
+    "my_place": my_place,
     "my_profile": my_profile,
     "forget_about_me": forget_about_me,
     "web_search": web_search,
@@ -1958,6 +2013,12 @@ SCHEMAS: list[dict] = [
         {"steps": {"type": "integer", "description": "1 = the newest change (default). 2 = the one before it, and so on. Call list_recent_changes first if they mean something further back."}}),
     _fn("list_recent_changes", "Show the recent changes you've made to their plan/reminders, newest first, as an undo menu. Use for 'what did you just change', 'what did you do', or before undoing something further back than the last action.",
         {"limit": {"type": "integer", "description": "How many to list. Default 8."}}),
+    _fn("set_my_place", "Save WHERE THIS USER LIVES. Call it as soon as they mention their city, country or timezone ('I'm in Dubai', 'I moved to Berlin', 'set my timezone to IST'), and whenever a time they gave clearly doesn't match the timezone you're using. Each user of this bot lives somewhere different — never assume one place for everyone.",
+        {"timezone": {"type": "string", "description": "IANA name, e.g. Asia/Kolkata, Asia/Dubai, Europe/Berlin, America/New_York."},
+         "country": {"type": "string", "description": "e.g. India, UAE, Germany."},
+         "currency": {"type": "string", "description": "ISO code, e.g. INR, AED, EUR, USD."},
+         "checkin_hour": {"type": "integer", "description": "Local hour (0-23) for the evening 'is it done?' message. Default 21."}}),
+    _fn("my_place", "Show the timezone, country, currency and check-in hour currently used for this user. Use when they ask what timezone you're using, or if times look wrong.", {}),
     _fn("my_profile", "Show what you currently know about this user.", {}),
     _fn("forget_about_me", "Remove a remembered fact, or clear the profile if no fact is given.",
         {"fact": {"type": "string", "description": "Words from the line to drop. Omit to clear everything."}}),

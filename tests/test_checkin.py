@@ -19,6 +19,19 @@ os.environ["ENCRYPTION_KEY"] = Fernet.generate_key().decode()
 
 import db
 from scheduler import jobs
+from datetime import datetime as _dt
+from zoneinfo import ZoneInfo as _ZI
+
+
+def due_now(*uids):
+    """Pin these users' check-in hour to whatever hour it is for them now.
+
+    evening_checkin is per-user now: it only messages someone when their own
+    local check-in hour comes round, so a test has to say when that is.
+    """
+    for u in uids:
+        tz = _ZI(db.get_locale(u)["timezone"])
+        db.set_locale(u, checkin_hour=_dt.now(tz).hour)
 
 db.init_db()
 UID = 909
@@ -57,6 +70,7 @@ check("undated normal task NOT chased", "Read DDIA chapter" not in chased, str(c
 check("far-future task NOT chased", "Renew domain" not in chased, str(chased))
 
 print("\n2. Evening check-in ASKS, batched into one message")
+due_now(UID)
 bot = FakeBot()
 asyncio.run(jobs.evening_checkin(bot))
 check("exactly one message sent", len(bot.sent) == 1, f"{len(bot.sent)} messages")
@@ -103,6 +117,7 @@ check("still excludes the parked backlog", "Read DDIA" not in m, m[:150])
 print("\n6. A user with only parked work is left alone entirely")
 OTHER = 910
 db.get_or_create_user(OTHER, "Quiet")
+due_now(OTHER)
 db.add_task(OTHER, "Someday: learn Rust", None, 2, None)
 bot4 = FakeBot()
 asyncio.run(jobs.evening_checkin(bot4))
@@ -113,6 +128,7 @@ check("no messages at all", not [s for s in bot4.sent if s[0] == OTHER],
 print("\n7. Singular vs plural reads naturally")
 SOLO = 911
 db.get_or_create_user(SOLO, "Solo")
+due_now(SOLO)
 db.add_task(SOLO, "One job", None, 1, NOW - timedelta(hours=2))
 bot5 = FakeBot()
 asyncio.run(jobs.evening_checkin(bot5))

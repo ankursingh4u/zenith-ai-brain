@@ -74,10 +74,10 @@ async def send_task_digest(bot) -> None:
     due-soon and explicitly-urgent items are the only things worth opening
     the day with.
     """
-    tz = ZoneInfo(config.TIMEZONE)
-    now_local = _now()
     now_utc = datetime.utcnow()
     for uid in db.users_with_open_tasks():
+        tz = ZoneInfo(db.get_locale(uid)["timezone"])   # THEIR clock, not ours
+        now_local = datetime.now(tz)
         rows = db.worth_chasing(uid, now_utc)
         if not rows:
             continue                      # nothing live — say nothing
@@ -95,14 +95,25 @@ async def evening_checkin(bot) -> None:
     only what qualifies, and escalates its wording the longer something sits —
     a commitment asked about five times is not "still open", it's stuck.
     """
-    tz = ZoneInfo(config.TIMEZONE)
-    now_local = _now()
     now_utc = datetime.utcnow()
-    # "Still open from today" has to mean the whole day, including work due
-    # later tonight — otherwise the message contradicts its own wording.
-    end_of_day = now_local.replace(hour=23, minute=59, second=59)
-    hours_left = max(0, int((end_of_day - now_local).total_seconds() // 3600) + 1)
+    # Runs hourly: each user is messaged when it is THEIR check-in hour, so
+    # someone in Berlin isn't asked "how did today go?" at 4pm.
+    hour_by_tz = {}
+    for tz_name in db.all_user_timezones():
+        try:
+            hour_by_tz[tz_name] = datetime.now(ZoneInfo(tz_name)).hour
+        except Exception:  # noqa: BLE001 — a bad tz must not stop everyone else
+            continue
+    due_now = set(db.users_for_checkin(hour_by_tz))
     for uid in db.users_with_open_tasks():
+        if uid not in due_now:
+            continue
+        tz = ZoneInfo(db.get_locale(uid)["timezone"])
+        now_local = datetime.now(tz)
+        # "Still open from today" has to mean the whole day, including work due
+        # later tonight — otherwise the message contradicts its own wording.
+        end_of_day = now_local.replace(hour=23, minute=59, second=59)
+        hours_left = max(0, int((end_of_day - now_local).total_seconds() // 3600) + 1)
         rows = db.worth_chasing(uid, now_utc, horizon_hours=hours_left)
         if not rows:
             continue
@@ -136,13 +147,16 @@ def start_scheduler(application) -> AsyncIOScheduler:
         send_task_digest, trigger=CronTrigger(hour=config.DAILY_JOB_HOUR, minute=5),
         args=[application.bot], id="task_digest", replace_existing=True,
     )
+    # Hourly, not once: users are in different timezones, and each is messaged
+    # only when their OWN check-in hour comes round.
     scheduler.add_job(
-        evening_checkin, trigger=CronTrigger(hour=config.CHECKIN_HOUR, minute=0),
+        evening_checkin, trigger=CronTrigger(minute=0),
         args=[application.bot], id="evening_checkin", replace_existing=True,
     )
     scheduler.start()
-    log.info("Scheduler started — bills %02d:00, morning list %02d:05, "
-             "evening check-in %02d:00 (%s), reminders every minute.",
-             config.DAILY_JOB_HOUR, config.DAILY_JOB_HOUR, config.CHECKIN_HOUR,
-             config.TIMEZONE)
+    log.info("Scheduler started — bills %02d:00, morning list %02d:05 (server tz "
+             "%s), evening check-in hourly at each user's own %02d:00 default, "
+             "reminders every minute.",
+             config.DAILY_JOB_HOUR, config.DAILY_JOB_HOUR, config.TIMEZONE,
+             config.CHECKIN_HOUR)
     return scheduler

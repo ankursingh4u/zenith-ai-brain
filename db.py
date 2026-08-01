@@ -48,6 +48,16 @@ class User(Base):
     # Injected into the prompt so the assistant fits them, not a hardcoded persona.
     profile: Mapped[Optional[str]] = mapped_column(Text)
 
+    # Where THIS person is. Different users live in different places, so none of
+    # this can be global: a reminder for "7am" means 7am where THEY are, and
+    # "lakh" means nothing to someone in Berlin. NULL = fall back to the
+    # server default in config, which is only a default, never an assumption.
+    timezone: Mapped[Optional[str]] = mapped_column(String(64))
+    country: Mapped[Optional[str]] = mapped_column(String(64))
+    currency: Mapped[Optional[str]] = mapped_column(String(8))
+    # Local hour for the "is it done?" pass. NULL = the server default.
+    checkin_hour: Mapped[Optional[int]] = mapped_column()
+
     # Encrypted Google OAuth token (JSON), set after the user connects Google.
     google_token_enc: Mapped[Optional[str]] = mapped_column(Text)
     google_email: Mapped[Optional[str]] = mapped_column(String(255))
@@ -328,7 +338,9 @@ def _migrate_add_columns() -> None:
         "users": [("verified", "INTEGER DEFAULT 0"), ("custom_sa_enc", "TEXT"),
                   ("custom_oauth_enc", "TEXT"), ("default_account", "TEXT"),
                   ("failed_attempts", "INTEGER DEFAULT 0"), ("banned_until", "DATETIME"),
-                  ("profile", "TEXT")],
+                  ("profile", "TEXT"), ("timezone", "VARCHAR(64)"),
+                  ("country", "VARCHAR(64)"), ("currency", "VARCHAR(8)"),
+                  ("checkin_hour", "INTEGER")],
     }
     insp = inspect(_engine)
     with _engine.begin() as conn:
@@ -1089,6 +1101,71 @@ def users_with_open_tasks() -> list[int]:
     with session() as s:
         return list(s.scalars(select(Task.telegram_id).where(
             Task.status == "open").distinct()).all())
+
+
+def get_locale(telegram_id: int) -> dict:
+    """This user's own place settings, falling back to the server defaults.
+
+    Never assume: the fallback is a default for a user we know nothing about
+    yet, not a claim about where they are. `known` says which it is, so the
+    assistant can ask instead of guessing.
+    """
+    with session() as s:
+        u = s.get(User, telegram_id)
+        tz = (u.timezone if u else None) or config.TIMEZONE
+        country = (u.country if u else None) or config.COUNTRY
+        currency = (u.currency if u else None) or config.CURRENCY
+        checkin = (u.checkin_hour if u else None)
+        return {
+            "timezone": tz,
+            "country": country,
+            "currency": currency,
+            "checkin_hour": config.CHECKIN_HOUR if checkin is None else checkin,
+            "known": bool(u and u.timezone),
+        }
+
+
+def set_locale(telegram_id: int, timezone: str | None = None,
+               country: str | None = None, currency: str | None = None,
+               checkin_hour: int | None = None) -> bool:
+    """Save where this user is. Only the fields given are touched."""
+    with session() as s:
+        u = s.get(User, telegram_id)
+        if u is None:
+            return False
+        if timezone:
+            u.timezone = timezone.strip()
+        if country:
+            u.country = country.strip()
+        if currency:
+            u.currency = currency.strip().upper()
+        if checkin_hour is not None:
+            u.checkin_hour = max(0, min(int(checkin_hour), 23))
+        s.commit()
+        return True
+
+
+def users_for_checkin(hour_by_tz: dict[str, int]) -> list[int]:
+    """Everyone whose own local check-in hour is happening right now.
+
+    Takes a {timezone: current_local_hour} map so the caller computes the clock
+    once instead of per user.
+    """
+    out = []
+    with session() as s:
+        for u in s.scalars(select(User)).all():
+            tz = u.timezone or config.TIMEZONE
+            want = config.CHECKIN_HOUR if u.checkin_hour is None else u.checkin_hour
+            if hour_by_tz.get(tz) == want:
+                out.append(u.telegram_id)
+    return out
+
+
+def all_user_timezones() -> set[str]:
+    """Every distinct timezone in use, so the scheduler knows which clocks matter."""
+    with session() as s:
+        rows = s.scalars(select(User.timezone)).all()
+    return {tz for tz in rows if tz} | {config.TIMEZONE}
 
 
 def get_profile(telegram_id: int) -> str | None:

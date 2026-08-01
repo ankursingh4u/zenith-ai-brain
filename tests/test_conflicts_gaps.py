@@ -21,7 +21,7 @@ db.init_db()
 UID = 777
 db.get_or_create_user(UID, "Test")
 fails = []
-TOMORROW = (datetime.now(tools._TZ) + timedelta(days=1)).date().isoformat()
+TOMORROW = (datetime.now(tools._tz(UID)) + timedelta(days=1)).date().isoformat()
 
 
 def check(label, cond, detail=""):
