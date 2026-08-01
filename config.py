@@ -60,6 +60,9 @@ MEMORY_SCAN_LIMIT = int(os.getenv("MEMORY_SCAN_LIMIT", "4000"))
 # How many undo points to keep per user. Each is a snapshot of that user's
 # plan + reminders, so this is kilobytes, not megabytes.
 UNDO_HISTORY = int(os.getenv("UNDO_HISTORY", "20"))
+# Evening "is it done?" pass. Local hour, 24h. This is a question, not another
+# list — see scheduler/jobs.evening_checkin.
+CHECKIN_HOUR = int(os.getenv("CHECKIN_HOUR", "21"))
 
 # --- Voice (speech-to-text + text-to-speech) ---
 STT_MODEL = os.getenv("STT_MODEL", "whisper-1").strip()        # transcription

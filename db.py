@@ -7,7 +7,7 @@ impossible to forget.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from sqlalchemy import (
@@ -196,6 +196,11 @@ class Task(Base):
     recur: Mapped[Optional[str]] = mapped_column(String(16))
     last_done_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     streak: Mapped[int] = mapped_column(default=0)
+    # Chasing state. Without these the bot either asks about everything every
+    # day (noise) or forgets a commitment entirely. nudges lets the wording
+    # escalate: a thing asked about four times is not "still open", it's stuck.
+    last_nudged_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    nudges: Mapped[int] = mapped_column(default=0)
 
 
 class ConversationTurn(Base):
@@ -318,7 +323,8 @@ def _migrate_add_columns() -> None:
                   ("track", "VARCHAR(40)"), ("order_idx", "INTEGER DEFAULT 0"),
                   ("gate", "TEXT"), ("target", "INTEGER"),
                   ("progress", "INTEGER DEFAULT 0"), ("recur", "VARCHAR(16)"),
-                  ("last_done_at", "DATETIME"), ("streak", "INTEGER DEFAULT 0")],
+                  ("last_done_at", "DATETIME"), ("streak", "INTEGER DEFAULT 0"),
+                  ("last_nudged_at", "DATETIME"), ("nudges", "INTEGER DEFAULT 0")],
         "users": [("verified", "INTEGER DEFAULT 0"), ("custom_sa_enc", "TEXT"),
                   ("custom_oauth_enc", "TEXT"), ("default_account", "TEXT"),
                   ("failed_attempts", "INTEGER DEFAULT 0"), ("banned_until", "DATETIME"),
@@ -1038,6 +1044,44 @@ def find_tasks(telegram_id: int, text: str, status: str = "open") -> list["Task"
         return []
     return [t for t in list_tasks(telegram_id, status=status, limit=200)
             if needle in (t.title or "").lower()]
+
+
+def worth_chasing(telegram_id: int, now_utc: datetime, horizon_hours: int = 18) -> list["Task"]:
+    """Open work that actually deserves a nudge — not everything on the list.
+
+    Something qualifies if it is overdue, due inside the horizon, or explicitly
+    urgent (priority 1). A task with no deadline and normal priority is
+    something the user parked on purpose; chasing it is noise.
+    """
+    cutoff = now_utc + timedelta(hours=horizon_hours)
+    with session() as s:
+        rows = s.scalars(select(Task).where(
+            Task.telegram_id == telegram_id,
+            Task.status == "open",
+            Task.kind.notin_(("track", "habit")),
+        ).order_by(Task.due_at.is_(None), Task.due_at, Task.priority)).all()
+        out = []
+        for t in rows:
+            if t.due_at is not None and t.due_at <= cutoff:
+                out.append(t)
+            elif t.priority == 1 and t.due_at is None:
+                out.append(t)
+        for t in out:
+            s.expunge(t)
+        return out
+
+
+def mark_nudged(telegram_id: int, task_ids: list[int], now_utc: datetime) -> None:
+    """Record that we asked, so the next ask can be worded differently."""
+    if not task_ids:
+        return
+    with session() as s:
+        for tid in task_ids:
+            t = s.get(Task, tid)
+            if t is not None and t.telegram_id == telegram_id:   # ownership check
+                t.last_nudged_at = now_utc
+                t.nudges = (t.nudges or 0) + 1
+        s.commit()
 
 
 def users_with_open_tasks() -> list[int]:

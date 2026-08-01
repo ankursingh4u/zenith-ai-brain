@@ -19,6 +19,7 @@ SUITES = [
     ("semantic memory", "test_semantic.py"),
     ("web access + fuzzy", "test_web_fuzzy.py"),
     ("encryption key rotation", "test_key_rotation.py"),
+    ("check-in / chasing", "test_checkin.py"),
 ]
 
 
