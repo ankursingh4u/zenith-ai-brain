@@ -190,6 +190,39 @@ check("plan still works", "DSA" in tools.add_plan(UID, [{"title": "DSA", "kind":
 check("money still works", "450" in tools.log_transaction(UID, 450, "out", "food"))
 check("habits still work", "gym" in tools.add_habit(UID, "gym", "daily").lower())
 
+print("\n14b. Notes link themselves into the graph")
+tools.write_note(UID, "Redis cache-aside", "Cache aside on the read path. p95 dropped.",
+                 folder="Dev")
+tools.write_note(UID, "Cache invalidation", "Invalidate on write, not on a timer.",
+                 folder="Dev")
+body = notes.read_note(UID, "Cache invalidation")[1]
+check("a related block was added", notes.RELATED_MARK in body, body[:200])
+check("it links the note about the same thing", "[[Redis cache-aside]]" in body, body[-200:])
+check("it does not link itself", "[[Cache invalidation]]" not in body)
+# Appending must not stack a second block, or the note fills up with them.
+tools.append_note(UID, "Cache invalidation", "Also: stampede protection.")
+body = notes.read_note(UID, "Cache invalidation")[1]
+check("still exactly one related block", body.count(notes.RELATED_MARK) == 1,
+      str(body.count(notes.RELATED_MARK)))
+check("the appended line is above the block",
+      body.index("stampede") < body.index(notes.RELATED_MARK), body[-260:])
+check("what the user wrote is recoverable on its own",
+      notes.RELATED_MARK not in notes.strip_related(body)
+      and "stampede" in notes.strip_related(body))
+tools.daily_note(UID, "not a place for auto links")
+daily_body = notes.read_note(UID, notes.daily_path())[1]
+check("daily notes are left alone", notes.RELATED_MARK not in daily_body)
+check("so is the inbox", notes.RELATED_MARK not in
+      (notes.read_note(UID, notes.inbox_path()) or (None, ""))[1])
+
+print("\n14c. The agent gets the user's own notes for the question asked")
+ctx = notes.context_for(UID, "cache invalidation")
+check("the matching note is in the context", "Cache invalidation" in ctx, ctx[:160])
+check("it carries the text, not just the title", "Invalidate on write" in ctx, ctx[:200])
+check("the auto-link block is stripped out of it", notes.RELATED_MARK not in ctx)
+check("no notes, no context", notes.context_for(OTHER, "cache invalidation") == "")
+check("empty question is cheap and silent", notes.context_for(UID, "") == "")
+
 print("\n15. GitHub failures explain themselves instead of blowing up")
 # _explain reads self.repo/self.branch. It was written as a staticmethod once,
 # and the 404 branch — wrong repo name or wrong branch, the mistake everyone

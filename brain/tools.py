@@ -1338,14 +1338,35 @@ def save_password(telegram_id: int, name: str, secret: str, username: str | None
     return f"🔒 Saved credential '{name}' (encrypted)."
 
 
+# A retrieved secret waits here for the bot to hand it over itself, instead of
+# being returned to the model. Three things went wrong when the plaintext came
+# back through the reply: it was written into the conversation table next to the
+# encrypted copy (so the vault's encryption bought nothing against anyone
+# holding the .db file), it was re-sent to the LLM provider with every following
+# turn while it sat in the history window, and it stayed in Telegram forever.
+# A plain dict, not a ContextVar: the tool runs in a worker thread and the
+# handler reads this from the event loop, and context does not cross that.
+_pending_secret: dict[int, str] = {}
+
+
+def take_pending_secret(telegram_id: int) -> str | None:
+    """Pop the secret this user just asked for, for the bot to send directly."""
+    return _pending_secret.pop(telegram_id, None)
+
+
 def get_password(telegram_id: int, name: str) -> str:
     row = db.get_secret(telegram_id, name)
     if not row:
         return f"No saved credential named '{name}'. Use 'list passwords' to see names."
     secret = crypto.decrypt(row.secret_enc)
     user_line = f"User: {row.username}\n" if row.username else ""
-    return (f"🔐 {row.name}\n{user_line}Password: {secret}\n\n"
-            f"⚠️ Delete this message after use — Telegram keeps chat history.")
+    _pending_secret[telegram_id] = (
+        f"🔐 {row.name}\n{user_line}Password: {secret}\n\n"
+        f"This message deletes itself in 90 seconds.")
+    # What the MODEL sees — deliberately not the secret.
+    return (f"Found '{row.name}'. It has been sent to the user in a separate "
+            f"message, which self-deletes. You do NOT have the value and must "
+            f"not ask for it. Just tell them it's above.")
 
 
 def list_passwords(telegram_id: int) -> str:

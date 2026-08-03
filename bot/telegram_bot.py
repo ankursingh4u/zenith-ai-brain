@@ -89,6 +89,33 @@ async def _reply(message, text: str) -> None:
         await message.reply_text(part)
 
 
+# How long a revealed credential stays on screen before the bot removes it.
+SECRET_TTL = 90
+
+
+async def _deliver_secret(ctx, chat_id: int, uid: int) -> bool:
+    """Hand over a credential the vault just decrypted, and take it back.
+
+    The value never goes through the model or the saved conversation — see
+    tools.get_password. It is sent from here, then deleted, so it doesn't sit
+    in the chat forever waiting for someone to scroll up.
+    """
+    secret = tools.take_pending_secret(uid)
+    if not secret:
+        return False
+    msg = await ctx.bot.send_message(chat_id, secret)
+
+    async def _burn():
+        try:
+            await asyncio.sleep(SECRET_TTL)
+            await ctx.bot.delete_message(chat_id, msg.message_id)
+        except Exception:  # noqa: BLE001 — already gone, or Telegram said no
+            pass
+
+    asyncio.create_task(_burn())
+    return True
+
+
 # Pending yes/no confirmations for override actions, keyed by telegram_id.
 _pending: dict[int, dict] = {}
 
@@ -810,6 +837,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     db.save_turn(uid, "user", text)
     db.save_turn(uid, "assistant", reply)
+    # Before the reply, so "it's in the message above" is actually true.
+    await _deliver_secret(ctx, update.effective_chat.id, uid)
     await _reply(update.message, reply)
 
 
@@ -845,6 +874,8 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         reply = f"⚠️ Something went wrong: {e}"
     db.save_turn(uid, "user", transcript)
     db.save_turn(uid, "assistant", reply)
+    # A credential is never spoken aloud — the model doesn't have it to speak.
+    await _deliver_secret(ctx, chat_id, uid)
 
     text_out = f"🎤 You: {transcript}\n\n{reply}"
     if config.VOICE_REPLIES:
@@ -884,6 +915,7 @@ async def _text_document(update: Update, uid: int, caption: str,
         reply += f"\n\n(Only the first {LIMIT} characters were read.)"
     db.save_turn(uid, "user", f"[file {filename}] {caption}")
     db.save_turn(uid, "assistant", reply)
+    await _deliver_secret(ctx, update.effective_chat.id, uid)
     await _reply(update.message, reply)
 
 

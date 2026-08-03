@@ -204,5 +204,55 @@ check("every menu button still has a handler",
       all(asyncio.run(tb._menu_action(FakeUpdate(UID, b), FakeCtx([]), UID, b))
           for b in buttons), str(buttons))
 
+print("\n11. A retrieved password never reaches the model or the chat history")
+import crypto as _crypto  # noqa: E402
+from brain import tools as _t  # noqa: E402
+
+db.save_secret(UID, "gmail", _crypto.encrypt("hunter2-s3cret"), "ankur@example.com")
+model_sees = _t.get_password(UID, "gmail")
+check("the model is not given the value", "hunter2-s3cret" not in model_sees, model_sees)
+check("the model is told where it went", "separate message" in model_sees, model_sees)
+held = _t.take_pending_secret(UID)
+check("the bot gets the real credential", held and "hunter2-s3cret" in held, str(held)[:40])
+check("and it says it self-deletes", "deletes itself" in (held or ""))
+check("the queue is emptied by taking it", _t.take_pending_secret(UID) is None)
+
+# What would land in the conversation table is the model's reply, and the model
+# only ever saw the placeholder — so nothing to redact.
+db.save_turn(UID, "assistant", model_sees)
+stored = "\n".join(t["content"] for t in db.recent_turns(UID, limit=50))
+check("nothing in stored history contains the secret", "hunter2-s3cret" not in stored)
+check("a missing credential is a normal answer, not a leak",
+      "No saved credential" in _t.get_password(UID, "nope") and _t.take_pending_secret(UID) is None)
+
+
+class BurnBot(FakeBot):
+    """Sends and deletes like Telegram, so the TTL path can be exercised."""
+
+    def __init__(self):
+        super().__init__()
+        self.sent_ids = []
+
+    async def send_message(self, chat_id, text, **kw):
+        self.sent.append(text)
+        self.sent_ids.append(len(self.sent))
+        return type("M", (), {"message_id": len(self.sent)})()
+
+
+async def _secret_flow():
+    ctx = FakeCtx([])
+    ctx.bot = BurnBot()
+    _t.get_password(UID, "gmail")
+    delivered = await tb._deliver_secret(ctx, UID, UID)
+    return ctx, delivered
+
+
+ctx, delivered = asyncio.run(_secret_flow())
+check("the bot sends the credential itself", delivered and any("hunter2-s3cret" in m for m in ctx.bot.sent))
+check("nothing sent when no credential is pending",
+      asyncio.run(tb._deliver_secret(FakeCtx([]), UID, UID)) is False)
+check("a TTL is set for burning it", tb.SECRET_TTL and tb.SECRET_TTL <= 300, str(tb.SECRET_TTL))
+db.delete_secret(UID, "gmail")
+
 print("\n" + ("ALL PASSED" if not fails else f"{len(fails)} FAILED: {fails}"))
 sys.exit(1 if fails else 0)

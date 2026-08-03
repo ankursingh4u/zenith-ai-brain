@@ -125,7 +125,7 @@ def title_of(path: str) -> str:
 # --- Reading --------------------------------------------------------------
 def _index(telegram_id: int, path: str, title: str, body: str,
            remote_sha: str | None = None, embed: bool = True,
-           tags: list[str] | None = None):
+           tags: list[str] | None = None, vec: list[float] | None = None):
     """Store/refresh one note in the local index (and its embedding).
 
     `tags` carries the ones that aren't discoverable from the body — the
@@ -136,7 +136,9 @@ def _index(telegram_id: int, path: str, title: str, body: str,
     vector = None
     if embed:
         try:
-            vec = memory.embed(f"{title}\n{body[:4000]}")
+            # Reuse the caller's embedding when it has one — write() needs the
+            # same vector to find related notes, and that is a paid API call.
+            vec = vec if vec is not None else memory.embed(f"{title}\n{body[:4000]}")
             vector = json.dumps(vec) if vec else None
         except Exception:  # noqa: BLE001 — search quality, never a blocker
             vector = None
@@ -225,6 +227,9 @@ def write(telegram_id: int, title: str, content: str, folder: str | None = None,
             old_body = ""
 
     content = (content or "").strip()
+    # Append below what they wrote, not below the block we maintain, or every
+    # addition would push the related links further into the middle of the note.
+    old_body = strip_related(old_body)
     if mode == "append" and old_body:
         body = f"{old_body.rstrip()}\n\n{content}"
     elif mode == "prepend" and old_body:
@@ -237,6 +242,21 @@ def write(telegram_id: int, title: str, content: str, folder: str | None = None,
         t = str(t).strip().lstrip("#")
         if t and t not in all_tags:
             all_tags.append(t)
+
+    # Link it into the graph. A vault only becomes a second brain if notes find
+    # each other; leaving that to whoever remembers what already exists means it
+    # never happens. Links the user typed themselves are kept as they are — this
+    # only maintains its own block at the end.
+    vec = None
+    if path.split("/")[0].lower() not in _NO_LINK_FOLDERS:
+        try:
+            vec = memory.embed(f"{note_title}\n{body[:4000]}")
+        except Exception:  # noqa: BLE001
+            vec = None
+        already = {l.lower() for l in extract_links(body)}
+        suggestions = [t for t in related(telegram_id, note_title, body, path, vec)
+                       if t.lower() not in already]
+        body = with_related(body, suggestions)
 
     created = None
     if existing and existing.created_at:
@@ -260,7 +280,7 @@ def write(telegram_id: int, title: str, content: str, folder: str | None = None,
         detail = str(e)
         log.warning("vault push failed for %s: %s", path, e)
 
-    _index(telegram_id, path, note_title, body, sha, tags=all_tags)
+    _index(telegram_id, path, note_title, body, sha, tags=all_tags, vec=vec)
     # Set it either way: a note that failed to push must go back to "not in the
     # vault", or an edit made while GitHub was down would never be sent again.
     db.set_note_pushed(telegram_id, path, sha if pushed else None)
@@ -380,6 +400,95 @@ def search(telegram_id: int, query: str, limit: int = 8) -> list[dict]:
                     "body": n.body, "tags": n.tags or ""}
                    for n in db.find_notes(telegram_id, query, limit=limit)]
     return results[:limit]
+
+
+# Obsidian hides %% … %% comments in preview, which makes it a good marker for
+# a block the bot maintains: visible while editing, invisible while reading, and
+# unambiguous to find again so regenerating it never duplicates or eats a line
+# the user wrote themselves.
+RELATED_MARK = "%% related — maintained by brain, edit freely above this line %%"
+# Everything from the marker to the end of the note. The block is always written
+# last, so this is unambiguous — and it must NOT stop at the next heading, since
+# the block contains one ("## Related") and a lazy match ate only the marker,
+# leaving orphaned links behind that then looked like links the user had typed.
+_RELATED_BLOCK = re.compile(re.escape(RELATED_MARK) + r".*\Z", re.S)
+# Folders where an auto-link block would be noise, not a graph.
+_NO_LINK_FOLDERS = ("daily", "inbox")
+
+
+def strip_related(body: str) -> str:
+    """The note without the block we maintain — what the user actually wrote."""
+    return _RELATED_BLOCK.sub("", body or "").rstrip()
+
+
+def related(telegram_id: int, title: str, body: str, path: str | None = None,
+            vec: list[float] | None = None, limit: int = 5,
+            min_score: float = 0.35) -> list[str]:
+    """Existing notes this one is actually about, closest first.
+
+    Uses embeddings when they're available and falls back to title-word overlap,
+    because a vault that stops linking itself the day an endpoint breaks is worse
+    than one that links a little more roughly.
+    """
+    own = (path or "").lower()
+    words = {w for w in re.findall(r"[a-z]{4,}", f"{title} {body}".lower())}
+    scored: list[tuple[float, str]] = []
+    for n in db.all_notes(telegram_id):
+        if n.path.lower() == own or (n.title or "").lower() == (title or "").lower():
+            continue
+        if n.path.split("/")[0].lower() in _NO_LINK_FOLDERS:
+            continue
+        if vec and n.vector:
+            try:
+                score = memory.cosine(vec, json.loads(n.vector))
+            except (TypeError, ValueError):
+                continue
+            if score >= min_score:
+                scored.append((score, n.title))
+            continue
+        # No embeddings: does either title show up in the other's words?
+        theirs = {w for w in re.findall(r"[a-z]{4,}", (n.title or "").lower())}
+        if theirs and theirs & words:
+            scored.append((len(theirs & words) / len(theirs), n.title))
+    scored.sort(key=lambda s: -s[0])
+    return [t for _, t in scored[:limit]]
+
+
+def with_related(body: str, links: list[str]) -> str:
+    """Attach (or refresh) the related-notes block at the end of a note."""
+    clean = strip_related(body)
+    if not links:
+        return clean
+    block = (f"\n\n{RELATED_MARK}\n## Related\n"
+             + "\n".join(f"- [[{t}]]" for t in links) + "\n")
+    return clean + block
+
+
+def context_for(telegram_id: int, query: str, limit: int = 3,
+                max_chars: int = 1600) -> str:
+    """The user's own notes on this subject, for the agent to answer FROM.
+
+    Their writing is better evidence of what they think than the model's guess
+    at it, so the relevant notes travel with the turn instead of waiting for the
+    model to decide to go looking.
+    """
+    if not query or db.count_notes(telegram_id) == 0:
+        return ""
+    try:
+        hits = search(telegram_id, query, limit=limit)
+    except Exception:  # noqa: BLE001 — grounding is a bonus, never a blocker
+        return ""
+    out, used = [], 0
+    for h in hits:
+        if h.get("score") and h["score"] < 0.3:
+            continue
+        excerpt = " ".join(strip_related(h["body"]).split())[:600]
+        piece = f"\n[[{h['title']}]] ({h['path']}):\n{excerpt}"
+        if used + len(piece) > max_chars:
+            break
+        out.append(piece)
+        used += len(piece)
+    return "".join(out)
 
 
 def backlinks(telegram_id: int, title: str) -> list[dict]:

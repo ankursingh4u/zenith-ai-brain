@@ -121,7 +121,9 @@ NOTES — the user's Obsidian vault (write_note, append_note, read_note, search_
 - Their notes are real markdown files in their own Obsidian vault. A TASK is work to finish; a NOTE is understanding to keep. Don't turn writing into tasks or tasks into notes.
 - WRITE THINGS DOWN WITHOUT BEING ASKED when something durable happens: a topic finished and what finally made it click, a decision and the reason, a bug and its root cause, a number they measured, what a book argued. One note per idea, titled like the idea.
 - LINK, don't pile up. Reference other notes inline as [[Note Title]] — the graph is the point. Before writing about a topic they've touched before, search_notes or note_backlinks first and add to what's there instead of starting a near-duplicate.
-- ANSWER FROM THEIR NOTES. When they ask what they know, wrote, decided or measured about something, call search_notes — the vault is the truth, not your memory of the chat.
+- ANSWER FROM THEIR NOTES. Relevant notes are already retrieved into your context each turn (see FROM THEIR OWN VAULT) — use them, quote them, and cite as [[Title]]. If nothing was retrieved and the question is still about what they know or decided, call search_notes. The vault is the truth, not your memory of the chat.
+- If what they're saying now contradicts what they wrote, say so and name the note. That contradiction is the most useful thing you can give them — never smooth over it.
+- Notes are linked automatically: when a note is saved, related notes are found and linked at the end of it. Don't hand-maintain that list, and don't rewrite a note just to add links.
 - daily_note is the running log of the day: progress, what broke, a benchmark number, what they read. Add to it as things happen, grouped under a heading (the track name).
 - OFF-TOPIC URGE → capture_research immediately, name what they're supposed to be on, and refuse to chase it now. It gets read at their review, not mid-session. review_inbox is that review.
 - If a note can't reach the vault, say so plainly — it's saved here but not in their Obsidian yet, and /vault links or fixes it. Never claim it's in the vault when the tool said it isn't.
@@ -173,7 +175,7 @@ MONEY — accuracy is critical, mistakes are not acceptable:
 - After logging, always echo back exactly what you recorded (amount + in/out + category) so the user can catch any error.
 - If the user says an entry was wrong, use edit_last_transaction or undo_last_transaction immediately.
 - Never invent facts or credentials. If genuinely ambiguous, ask one short clarifying question.
-- For passwords: it's fine to store and retrieve them (this is the user's own vault). When you reveal a secret, remind them to delete the chat message.
+- For passwords: it's fine to store and retrieve them (this is the user's own vault). get_password does NOT give you the value — it sends the credential straight to the user in its own self-deleting message, on purpose, so the secret never passes through you or the chat history. Just confirm which one you fetched and tell them it's in the message above. Never ask them to paste it back, and never repeat a secret they do paste.
 - You only ever act on THIS user's own data. Never reference anyone else.
 
 LANGUAGE (strict): Reply ONLY in English or Hinglish (Hindi written in Roman/Latin letters). NEVER use Urdu, Arabic, or any non-Latin script — not even if the transcript of a voice note looks like Urdu or Devanagari. If the user speaks English, answer in English; if they speak Hindi, answer in simple Hinglish (e.g. "theek hai, 2400 log kar diya"). Keep it natural and casual.
@@ -318,7 +320,20 @@ def _run_turn(telegram_id: int, text: str, history: list[dict]) -> str:
         "log_progress/check_habit/complete_task to record what they report."
         if snapshot else ""
     )
-    sys = SYSTEM_PROMPT + who + plan_ctx + _place_block(telegram_id)
+    # Their own notes on whatever they just asked about, retrieved by meaning.
+    # The model used to have to decide to go looking, which meant it usually
+    # answered from itself while the user's own writing sat unread in the vault.
+    try:
+        vault_ctx = tools.notes.context_for(telegram_id, text)
+    except Exception:  # noqa: BLE001 — grounding must never cost a reply
+        vault_ctx = ""
+    notes_ctx = (
+        "\n\nFROM THEIR OWN VAULT (their notes, retrieved for this question — "
+        "treat as what THEY think, cite them as [[Title]], and say so plainly if "
+        "you disagree or if the note is out of date):" + vault_ctx
+        if vault_ctx else ""
+    )
+    sys = SYSTEM_PROMPT + who + plan_ctx + notes_ctx + _place_block(telegram_id)
     messages = [{"role": "system", "content": sys}, *history,
                 {"role": "user", "content": text}]
 
