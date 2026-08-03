@@ -23,6 +23,7 @@ SUITES = [
     ("India locale + money", "test_locale_money.py"),
     ("multi-user locale", "test_multiuser_locale.py"),
     ("notes + Obsidian vault", "test_notes_vault.py"),
+    ("telegram /vault command", "test_telegram_vault.py"),
 ]
 
 

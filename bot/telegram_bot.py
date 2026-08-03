@@ -52,6 +52,43 @@ WELCOME = (
 )
 
 
+# Telegram refuses any message over 4096 characters — the send fails and the
+# user gets nothing at all, which reads as the bot ignoring them. A note read
+# back, a full plan or a statement summary goes past that easily, so long
+# answers are split on paragraph (then line) boundaries rather than lost.
+TG_LIMIT = 3900
+
+
+def _chunks(text: str, limit: int = TG_LIMIT) -> list[str]:
+    """Split a reply into Telegram-sized pieces, breaking where a human would."""
+    text = (text or "").strip() or "(no response)"
+    if len(text) <= limit:
+        return [text]
+    grouped: list[str] = []
+    for para in text.split("\n\n"):
+        if grouped and len(grouped[-1]) + len(para) + 2 <= limit:
+            grouped[-1] += "\n\n" + para
+        else:
+            grouped.append(para)
+    out: list[str] = []
+    for piece in grouped:
+        while len(piece) > limit:
+            cut = piece.rfind("\n", 0, limit)
+            if cut <= 0:                       # one enormous line: hard cut
+                cut = limit
+            out.append(piece[:cut].rstrip())
+            piece = piece[cut:].lstrip("\n")
+        if piece.strip():
+            out.append(piece)
+    return out or ["(no response)"]
+
+
+async def _reply(message, text: str) -> None:
+    """Send a reply of any length, in order."""
+    for part in _chunks(text):
+        await message.reply_text(part)
+
+
 # Pending yes/no confirmations for override actions, keyed by telegram_id.
 _pending: dict[int, dict] = {}
 
@@ -289,6 +326,7 @@ MENU_ROWS = [
     ["👉 What now", "🌳 My plan"],
     ["📋 Pending", "✔️ Tick off"],
     ["🔁 Habits", "⏰ Reminders"],
+    ["🗂 Notes", "📥 Inbox"],
     ["💰 Summary", "🧾 My sheets"],
     ["⚙️ Setup", "❓ Help"],
 ]
@@ -350,6 +388,10 @@ async def _menu_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                                             reply_markup=InlineKeyboardMarkup(kb))
     elif t == "⏰ Reminders":
         await update.message.reply_text(await asyncio.to_thread(tools.list_reminders, uid))
+    elif t == "🗂 Notes":
+        await _reply(update.message, await asyncio.to_thread(tools.list_notes, uid, None, 20))
+    elif t == "📥 Inbox":
+        await _reply(update.message, await asyncio.to_thread(tools.review_inbox, uid))
     elif t == "💰 Summary":
         await update.message.reply_text(await asyncio.to_thread(tools.get_summary, uid, 30))
     elif t == "🧾 My sheets":
@@ -768,7 +810,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     db.save_turn(uid, "user", text)
     db.save_turn(uid, "assistant", reply)
-    await update.message.reply_text(reply)
+    await _reply(update.message, reply)
 
 
 async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -842,7 +884,7 @@ async def _text_document(update: Update, uid: int, caption: str,
         reply += f"\n\n(Only the first {LIMIT} characters were read.)"
     db.save_turn(uid, "user", f"[file {filename}] {caption}")
     db.save_turn(uid, "assistant", reply)
-    await update.message.reply_text(reply[:3900])
+    await _reply(update.message, reply)
 
 
 def _amount_of(parsed: dict) -> float:
