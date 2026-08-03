@@ -18,6 +18,18 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s  %(name)s  %(message)s",
 )
+
+# httpx logs every request at INFO, and the long-polling URL has the bot token
+# in it: "POST https://api.telegram.org/bot<TOKEN>/getUpdates". That put the
+# token on every line of the container log, where anyone with log access — the
+# hosting UI, an API token, a log drain — could read it. Failures still show up,
+# because those are logged at WARNING and above.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+# The reminder sweep runs every minute and announced itself twice each time.
+# Six lines a minute of "nothing happened" buried the startup banner and the
+# actual errors; a job that fails still logs at WARNING.
+logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
+
 log = logging.getLogger("brain")
 
 
