@@ -152,8 +152,11 @@ class GitHubVault:
     def _url(self, path: str) -> str:
         return f"{_API}/repos/{self.repo}/contents/{self._full(path)}"
 
-    @staticmethod
-    def _explain(resp: httpx.Response) -> str:
+    def _explain(self, resp: httpx.Response) -> str:
+        """Turn a GitHub error into something the user can act on. Needs the
+        repo and branch, so it is NOT a staticmethod — it once was, and the
+        404 branch (wrong repo name, wrong branch: the most likely mistake
+        anyone makes at setup) died with a NameError instead of explaining."""
         try:
             msg = resp.json().get("message", "")
         except Exception:  # noqa: BLE001

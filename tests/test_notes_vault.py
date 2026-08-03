@@ -190,5 +190,41 @@ check("plan still works", "DSA" in tools.add_plan(UID, [{"title": "DSA", "kind":
 check("money still works", "450" in tools.log_transaction(UID, 450, "out", "food"))
 check("habits still work", "gym" in tools.add_habit(UID, "gym", "daily").lower())
 
+print("\n15. GitHub failures explain themselves instead of blowing up")
+# _explain reads self.repo/self.branch. It was written as a staticmethod once,
+# and the 404 branch — wrong repo name or wrong branch, the mistake everyone
+# makes at setup — died with a NameError instead of saying what was wrong.
+gh = vaultmod.GitHubVault("me/vault", "tok", "main")
+
+
+class FakeResp:
+    def __init__(self, code, message):
+        self.status_code, self._m, self.text = code, message, message
+
+    def json(self):
+        return {"message": self._m}
+
+
+for code, message, expect in (
+    (401, "Bad credentials", "refused the token"),
+    (403, "Resource not accessible", "refused the token"),
+    (404, "Not Found", "can't find me/vault"),
+    (409, "Git Repository is empty", "empty"),
+    (500, "Server Error", "GitHub error 500"),
+):
+    said = gh._explain(FakeResp(code, message))
+    check(f"{code} is explained, not raised", expect in said, said)
+check("404 names the branch too", "main" in gh._explain(FakeResp(404, "Not Found")))
+check("repo shape is validated before any request happens",
+      isinstance(getattr(vaultmod, "GitHubVault"), type))
+for bad in ("not-a-repo", "https://github.com/me/vault", ""):
+    try:
+        vaultmod.GitHubVault(bad, "tok")
+        check(f"rejects repo {bad!r}", False)
+    except vaultmod.VaultError:
+        check(f"rejects repo {bad!r}", True)
+check("a subfolder vault prefixes paths",
+      vaultmod.GitHubVault("me/v", "t", "main", "vault")._full("Daily/x.md") == "vault/Daily/x.md")
+
 print("\n" + ("ALL PASSED" if not fails else f"{len(fails)} FAILED: {fails}"))
 sys.exit(1 if fails else 0)
