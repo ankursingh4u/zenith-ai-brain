@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import re
 import socket
 from urllib.parse import urlparse
 
@@ -70,6 +71,96 @@ def check_url(url: str) -> tuple[bool, str]:
     if not p.hostname:
         return False, "that URL has no host in it"
     return _is_public(p.hostname)
+
+
+# --- YouTube ---------------------------------------------------------------
+# A video page is JavaScript, so the reader above pulls nothing off it but the
+# page footer — 145 characters of "About / Press / Copyright". The words are in
+# the transcript track instead, which is a separate, key-less endpoint.
+_YT_HOSTS = ("youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
+             "www.youtu.be", "music.youtube.com")
+_YT_ID = re.compile(r"^[\w-]{11}$")
+
+
+def youtube_id(url: str) -> str | None:
+    """The video id out of any shape of YouTube link, or None if it isn't one."""
+    raw = (url or "").strip()
+    if _YT_ID.match(raw):
+        return raw
+    try:
+        p = urlparse(raw if "//" in raw else "https://" + raw)
+    except ValueError:
+        return None
+    host = (p.hostname or "").lower()
+    if host not in _YT_HOSTS:
+        return None
+    if host.endswith("youtu.be"):
+        cand = p.path.lstrip("/").split("/")[0]
+        return cand if _YT_ID.match(cand) else None
+    if p.path in ("/watch", "/watch/"):
+        for part in (p.query or "").split("&"):
+            if part.startswith("v="):
+                cand = part[2:]
+                return cand if _YT_ID.match(cand) else None
+        return None
+    for prefix in ("/shorts/", "/embed/", "/live/", "/v/"):
+        if p.path.startswith(prefix):
+            cand = p.path[len(prefix):].split("/")[0]
+            return cand if _YT_ID.match(cand) else None
+    return None
+
+
+def youtube_meta(video_id: str) -> dict:
+    """Title and channel via oEmbed — public, no key, no quota."""
+    try:
+        with httpx.Client(timeout=TIMEOUT, headers={"User-Agent": UA}) as c:
+            r = c.get("https://www.youtube.com/oembed",
+                      params={"url": f"https://www.youtube.com/watch?v={video_id}",
+                              "format": "json"})
+        if r.status_code == 200:
+            d = r.json()
+            return {"title": d.get("title") or "", "channel": d.get("author_name") or ""}
+    except Exception as e:  # noqa: BLE001 — a missing title must not lose the transcript
+        log.info("youtube oembed failed for %s: %s", video_id, e)
+    return {"title": "", "channel": ""}
+
+
+def youtube_transcript(url: str, max_chars: int = 12000,
+                       languages: tuple[str, ...] = ("en", "en-US", "en-GB", "hi")) -> dict:
+    """{title, channel, language, text, truncated} for a video. Raises on failure."""
+    vid = youtube_id(url)
+    if not vid:
+        raise ValueError("that isn't a YouTube link I recognise")
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+    except ImportError as e:  # pragma: no cover — optional dependency
+        raise RuntimeError(
+            "the 'youtube-transcript-api' package isn't installed on this server") from e
+
+    api = YouTubeTranscriptApi()
+    try:
+        fetched = api.fetch(vid, languages=list(languages))
+    except Exception:  # noqa: BLE001 — no track in those languages; take any
+        try:
+            available = api.list(vid)
+            fetched = next(iter(available)).fetch()
+        except Exception as e:  # noqa: BLE001
+            raise ValueError(
+                "that video has no transcript available (the uploader can turn "
+                "captions off, and live streams often have none)") from e
+
+    snippets = list(fetched)
+    text = " ".join((s.text or "").replace("\n", " ") for s in snippets).strip()
+    text = re.sub(r"\s{2,}", " ", text)
+    if not text:
+        raise ValueError("that video's transcript came back empty")
+    limit = max(1000, min(int(max_chars or 12000), 40000))
+    truncated = len(text) > limit
+    meta = youtube_meta(vid)
+    return {"title": meta["title"], "channel": meta["channel"],
+            "language": getattr(fetched, "language_code", "?"),
+            "text": text[:limit], "truncated": truncated,
+            "minutes": round((snippets[-1].start + snippets[-1].duration) / 60) if snippets else 0}
 
 
 def search(query: str, count: int = 5) -> list[dict]:

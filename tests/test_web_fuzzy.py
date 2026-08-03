@@ -98,6 +98,32 @@ node, problem = tools._pick_node(UID, None, "zzzqqqxyw")
 check("no false match on nonsense", node is None, node.title if node else "")
 check("says so plainly", "Nothing in your plan matches" in (problem or ""), problem or "")
 
+print("\n9b. YouTube links are recognised in every shape they come in")
+for url, want in (
+    ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+    ("https://youtu.be/dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+    ("https://youtu.be/dQw4w9WgXcQ?t=42", "dQw4w9WgXcQ"),
+    ("https://www.youtube.com/watch?feature=share&v=dQw4w9WgXcQ&t=1", "dQw4w9WgXcQ"),
+    ("https://m.youtube.com/watch?v=dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+    ("https://www.youtube.com/shorts/dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+    ("https://www.youtube.com/embed/dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+    ("dQw4w9WgXcQ", "dQw4w9WgXcQ"),
+    ("https://vimeo.com/12345", None),
+    ("https://example.com/watch?v=dQw4w9WgXcQ", None),
+    ("not a url", None),
+):
+    check(f"{url[:46]:<46} -> {want}", web.youtube_id(url) == want, str(web.youtube_id(url)))
+
+print("\n9c. A video is actually read (live network)")
+out = tools.read_video(UID, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+check("transcript came back, not a page footer", len(out) > 500, f"{len(out)} chars")
+check("it is the spoken words", "never gonna give you up" in out.lower(), out[:200])
+check("titled from oEmbed", "🎬" in out and "Rick" in out, out[:120])
+check("says which language", "Transcript language" in out)
+check("a non-YouTube link is refused clearly",
+      "isn't a YouTube link" in tools.read_video(UID, "https://example.com"))
+check("nonsense doesn't crash it", "Couldn't read that video" in tools.read_video(UID, "banana"))
+
 print("\n10. Nothing regressed")
 check("registry and schemas agree",
       {s["function"]["name"] for s in tools.SCHEMAS} == set(tools.TOOLS))

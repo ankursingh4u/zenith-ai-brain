@@ -708,6 +708,24 @@ def read_page(telegram_id: int, url: str, max_chars: int = 6000) -> str:
     return f"📄 From {url}:\n\n{text}"
 
 
+def read_video(telegram_id: int, url: str, max_chars: int = 12000) -> str:
+    """Read what a YouTube video actually says, via its transcript."""
+    try:
+        got = web.youtube_transcript(url, max_chars)
+    except Exception as e:  # noqa: BLE001
+        return f"Couldn't read that video: {e}"
+    head = f"🎬 {got['title'] or 'Video'}"
+    if got["channel"]:
+        head += f" — {got['channel']}"
+    if got["minutes"]:
+        head += f" ({got['minutes']} min)"
+    body = (f"{head}\nTranscript language: {got['language']}\n\n{got['text']}")
+    if got["truncated"]:
+        body += ("\n\n[…transcript truncated. This is the start of the video; "
+                 "say so if you summarise only part of it.]")
+    return body
+
+
 def list_recent_changes(telegram_id: int, limit: int = 8) -> str:
     """What was changed recently, newest first — the undo menu."""
     rows = db.recent_actions(telegram_id, max(1, min(int(limit or 8), 20)))
@@ -2095,6 +2113,7 @@ TOOLS: dict[str, callable] = {
     "forget_about_me": forget_about_me,
     "web_search": web_search,
     "read_page": read_page,
+    "read_video": read_video,
     "undo_last": undo_last,
     "list_recent_changes": list_recent_changes,
     "show_plan": show_plan,
@@ -2469,6 +2488,10 @@ SCHEMAS: list[dict] = [
     _fn("review_inbox", "Read the parked research inbox (their Sunday review), or tick items off once read.",
         {"action": {"type": "string", "enum": ["list", "clear"], "description": "Default 'list'."},
          "item": {"type": "string", "description": "With action='clear': words from the one item to close. Omit to close all."}}),
+    _fn("read_video", "Read what a YouTube video says, by fetching its transcript. Use this for ANY youtube.com / youtu.be / shorts link — read_page returns nothing useful for videos, because the page is JavaScript. After reading, summarise it in the user's terms and offer to save it as a note.",
+        {"url": {"type": "string", "description": "The YouTube link, in any form."},
+         "max_chars": {"type": "integer", "description": "How much transcript to pull. Default 12000."}},
+        ["url"]),
     _fn("vault_status", "Where notes are being saved and whether that link works.", {}),
     _fn("sync_vault", "Pull in notes the user edited in Obsidian and push anything that hasn't reached the vault. Use it when they say they wrote something in Obsidian, or when a note seems out of date.", {}),
 ]

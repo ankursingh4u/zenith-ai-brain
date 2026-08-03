@@ -13,6 +13,11 @@ price-parser==0.3.4              # deterministic money-amount extraction (cross-
 # --- Web access + matching (free, keyless, small) ---
 trafilatura==2.1.0               # HTML -> readable article text (drops nav/ads)
 rapidfuzz==3.14.5                # approximate title matching (~1MB, C++)
+# A YouTube page is JavaScript, so trafilatura gets only the footer off it. The
+# words live in the caption track, which this reads. No API key, no quota. It
+# wants requests + defusedxml, neither of which touches the httpx pin above.
+youtube-transcript-api==1.2.4
+defusedxml==0.7.1
 
 # ddgs (DuckDuckGo search) is deliberately NOT listed here. It DECLARES
 # httpx>=0.28.1, but httpx 0.28 is impossible for us: python-telegram-bot 21.6
