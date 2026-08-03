@@ -6,6 +6,11 @@ env/
 __pycache__/
 *.pyc
 .env
+# Server-management credentials. Gitignored, but the image is built from the
+# working directory, so it has to be excluded here too or COPY . . bakes a
+# token that controls the whole Coolify server into every layer.
+coolify-secrets.txt
+*secrets*.txt
 *.db
 *.db-journal
 *.log
