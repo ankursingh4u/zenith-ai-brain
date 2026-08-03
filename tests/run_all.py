@@ -22,6 +22,7 @@ SUITES = [
     ("check-in / chasing", "test_checkin.py"),
     ("India locale + money", "test_locale_money.py"),
     ("multi-user locale", "test_multiuser_locale.py"),
+    ("notes + Obsidian vault", "test_notes_vault.py"),
 ]
 
 

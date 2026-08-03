@@ -77,6 +77,12 @@ def _embed(text: str) -> list[float] | None:
         return None
 
 
+def embed(text: str) -> list[float] | None:
+    """One embedding for anything that wants meaning-based search — notes as
+    well as chat history — or None where embeddings aren't available."""
+    return _embed(text)
+
+
 def selftest() -> bool:
     """Settle at startup whether embeddings work here, and say so in the log.
 
@@ -114,6 +120,11 @@ def remember(telegram_id: int, text: str, kind: str = "turn") -> bool:
     except Exception as e:  # noqa: BLE001
         log.warning("remember failed (ignored): %s", e)
         return False
+
+
+def cosine(a: list[float], b: list[float]) -> float:
+    """Similarity of two embeddings, for callers keeping their own vectors."""
+    return _cosine(a, b)
 
 
 def _cosine(a: list[float], b: list[float]) -> float:

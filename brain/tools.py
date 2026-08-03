@@ -21,7 +21,7 @@ from sqlalchemy import select
 import config
 import crypto
 import db
-from brain import memory, money, web
+from brain import memory, money, notes, web
 
 try:
     from rapidfuzz import fuzz
@@ -31,6 +31,7 @@ from integrations import calendar as gcal
 from integrations import client as goauth
 from integrations import docs as gdocs
 from integrations import drive, gmail, gservice, mailbox, pdf, sheets
+from integrations import vault as vaultmod
 
 _OAUTH_HINT = ("To use email / calendar / docs / drive, connect a Google account first — "
                "send /connect (you can link several).")
@@ -1874,6 +1875,182 @@ def list_mailboxes(telegram_id: int) -> str:
 
 
 # =========================================================================
+#  Obsidian vault — notes that live as real markdown the user owns
+# =========================================================================
+def _vault_hint(detail: str = "") -> str:
+    base = ("No Obsidian vault linked yet, so I kept the note here only. "
+            "Run /vault in Telegram to connect one — a GitHub repo (Obsidian "
+            "Git plugin pulls it) or a folder on the machine running me.")
+    return f"{base}\n({detail})" if detail else base
+
+
+def _wrote(res: dict, verb: str = "Saved") -> str:
+    line = f"📝 {verb} [[{res['title']}]] → {res['path']}"
+    if res["pushed"]:
+        return f"{line}\n✅ In your vault ({res['where']})."
+    return f"{line}\n⚠️ {_vault_hint(res['detail'])}"
+
+
+def write_note(telegram_id: int, title: str, content: str,
+               folder: str | None = None, tags: list | None = None,
+               mode: str = "replace") -> str:
+    """Write a markdown note into the user's Obsidian vault."""
+    if not (title or "").strip():
+        return "A note needs a title — that's the name Obsidian links to."
+    if mode not in ("replace", "append", "prepend"):
+        mode = "replace"
+    try:
+        res = notes.write(telegram_id, title, content or "", folder,
+                          [str(t) for t in (tags or [])], mode)
+    except vaultmod.VaultError as e:
+        return f"Couldn't write that note: {e}"
+    verb = {"replace": "Saved", "append": "Added to", "prepend": "Added to"}[mode]
+    return _wrote(res, verb)
+
+
+def append_note(telegram_id: int, title: str, content: str,
+                folder: str | None = None) -> str:
+    """Add to the end of an existing note (creates it if it's new)."""
+    return write_note(telegram_id, title, content, folder, None, "append")
+
+
+def read_note(telegram_id: int, note: str) -> str:
+    """Read one note back — by title, by path, or by roughly what it's called."""
+    got = notes.read_note(telegram_id, note)
+    if not got:
+        near = db.find_notes(telegram_id, note, limit=5)
+        if near:
+            return ("No note called that. Closest: "
+                    + ", ".join(f"'{n.title}'" for n in near))
+        return f"No note matching '{note}'. {notes_count_hint(telegram_id)}"
+    path, body = got
+    links = notes.extract_links(body)
+    out = f"📄 {notes.title_of(path)} ({path})\n\n{body[:4000]}"
+    if len(body) > 4000:
+        out += "\n… (truncated)"
+    if links:
+        out += "\n\nLinks out to: " + ", ".join(f"[[{l}]]" for l in links[:12])
+    back = notes.backlinks(telegram_id, notes.title_of(path))
+    if back:
+        out += "\n Linked from: " + ", ".join(f"[[{b['title']}]]" for b in back[:12])
+    return out
+
+
+def notes_count_hint(telegram_id: int) -> str:
+    n = db.count_notes(telegram_id)
+    return f"You have {n} note(s)." if n else "You have no notes yet."
+
+
+def search_notes(telegram_id: int, query: str, limit: int = 6) -> str:
+    """Search the vault by meaning, not just words."""
+    hits = notes.search(telegram_id, query, max(1, min(int(limit or 6), 15)))
+    if not hits:
+        return f"Nothing in your notes about '{query}'. {notes_count_hint(telegram_id)}"
+    out = [f"🔎 Notes about '{query}':"]
+    for h in hits:
+        snippet = " ".join(h["body"].split())[:220]
+        out.append(f"\n• [[{h['title']}]] ({h['path']})\n  {snippet}")
+    return "\n".join(out)
+
+
+def list_notes(telegram_id: int, folder: str | None = None, limit: int = 20) -> str:
+    """List notes, newest first, optionally inside one folder."""
+    rows = db.list_notes(telegram_id, folder, max(1, min(int(limit or 20), 60)))
+    if not rows:
+        return (f"No notes in '{folder}' yet." if folder
+                else "No notes yet. Say 'note this: …' and I'll start the vault.")
+    head = f"🗂 Notes in {folder}:" if folder else "🗂 Your notes:"
+    return head + "\n" + "\n".join(
+        f"• {r.title} — {r.path}"
+        + (f"  #{r.tags.replace(',', ' #')}" if r.tags else "") for r in rows)
+
+
+def note_backlinks(telegram_id: int, title: str) -> str:
+    """Which notes link to this one — the Obsidian backlink pane, as text."""
+    back = notes.backlinks(telegram_id, title)
+    if not back:
+        return f"Nothing links to [[{notes.title_of(title)}]] yet."
+    return (f"🔗 Linked to [[{notes.title_of(title)}]]:\n"
+            + "\n".join(f"• {b['title']} ({b['path']})" for b in back))
+
+
+def daily_note(telegram_id: int, content: str | None = None,
+               heading: str | None = None, day: str | None = None) -> str:
+    """Read today's daily note, or add a line to it."""
+    when = None
+    if day:
+        try:
+            when = datetime.strptime(day.strip()[:10], "%Y-%m-%d").date()
+        except ValueError:
+            return "Give the day as YYYY-MM-DD, or leave it out for today."
+    if not (content or "").strip():
+        got = notes.read_note(telegram_id, notes.daily_path(when))
+        if not got:
+            return "Nothing in today's note yet."
+        return f"📅 {got[0]}\n\n{got[1][:3000]}"
+    try:
+        res = notes.append_daily(telegram_id, content.strip(), heading, when)
+    except vaultmod.VaultError as e:
+        return f"Couldn't write the daily note: {e}"
+    return _wrote(res, "Added to")
+
+
+def capture_research(telegram_id: int, text: str, doing: str | None = None) -> str:
+    """Park an off-topic idea in the research inbox so focus isn't broken."""
+    if not (text or "").strip():
+        return "Nothing to capture."
+    try:
+        res = notes.capture(telegram_id, text.strip(), doing)
+    except vaultmod.VaultError as e:
+        return f"Couldn't reach the inbox note: {e}"
+    open_n = len(notes.inbox_items(telegram_id))
+    line = f"📥 Parked for Sunday: {text.strip()[:80]}"
+    if doing:
+        line += f"\nYou're on {doing} — back to it."
+    line += f"\n({open_n} thing(s) waiting in the inbox.)"
+    if not res["pushed"]:
+        line += f"\n⚠️ {_vault_hint(res['detail'])}"
+    return line
+
+
+def review_inbox(telegram_id: int, action: str = "list",
+                 item: str | None = None) -> str:
+    """Read the research inbox, or tick items off after reading them."""
+    if action == "clear":
+        n, detail = notes.inbox_close(telegram_id, item)
+        if not n:
+            return detail
+        return f"✅ Marked {n} inbox item(s) read: {detail}"
+    items = notes.inbox_items(telegram_id)
+    if not items:
+        return "📥 Research inbox is empty — nothing parked."
+    return (f"📥 {len(items)} thing(s) parked:\n"
+            + "\n".join(f"• {text}" for _, text, _ in items[:25])
+            + "\n\nSay 'done with <words>' to tick one off, or 'clear the inbox'.")
+
+
+def vault_status(telegram_id: int) -> str:
+    """Where notes are going, and whether that link actually works."""
+    line = vaultmod.status(telegram_id)
+    ok, detail = vaultmod.check(telegram_id)
+    count = db.count_notes(telegram_id)
+    out = f"{line}\n{'✅' if ok else '⚠️'} {detail}\n🗂 {count} note(s) indexed here."
+    if not ok:
+        out += "\nRun /vault to link or fix it."
+    return out
+
+
+def sync_vault(telegram_id: int) -> str:
+    """Pull notes edited in Obsidian, push anything that never made it out."""
+    try:
+        return notes.sync(telegram_id)
+    except vaultmod.NotConnected as e:
+        return str(e)
+    except vaultmod.VaultError as e:
+        return f"Vault sync failed: {e}"
+
+
+# =========================================================================
 #  Registry + schemas
 # =========================================================================
 TOOLS: dict[str, callable] = {
@@ -1953,6 +2130,17 @@ TOOLS: dict[str, callable] = {
     "check_mailbox": check_mailbox,
     "send_from_mailbox": send_from_mailbox,
     "list_mailboxes": list_mailboxes,
+    "write_note": write_note,
+    "append_note": append_note,
+    "read_note": read_note,
+    "search_notes": search_notes,
+    "list_notes": list_notes,
+    "note_backlinks": note_backlinks,
+    "daily_note": daily_note,
+    "capture_research": capture_research,
+    "review_inbox": review_inbox,
+    "vault_status": vault_status,
+    "sync_vault": sync_vault,
 }
 
 
@@ -2227,4 +2415,39 @@ SCHEMAS: list[dict] = [
          "account": {"type": "string", "description": "Which mailbox to send from. Optional."}},
         ["to", "subject", "body"]),
     _fn("list_mailboxes", "List the non-Google mailboxes (IMAP) the user has connected.", {}),
+
+    _fn("write_note", "Write a markdown note into the user's Obsidian vault — anything worth keeping as writing rather than as a task: what they learned, a decision and why, a book's argument, a design, a debugging post-mortem. Link related notes inline with [[Note Title]] so the vault builds a graph instead of a pile. Use their own words and keep the note self-contained.",
+        {"title": {"type": "string", "description": "The note's name — this is also its filename and what [[links]] point at. Short and specific: 'Sliding Window', 'Why the p95 dropped 60%'."},
+         "content": {"type": "string", "description": "Markdown body. Use [[Other Note]] to link, #tags to categorise."},
+         "folder": {"type": "string", "description": "Vault folder, e.g. 'DSA', 'Dev', 'Books'. Optional."},
+         "tags": {"type": "array", "items": {"type": "string"}, "description": "Extra tags. Optional."},
+         "mode": {"type": "string", "enum": ["replace", "append", "prepend"], "description": "Default 'replace'. Use 'append' to add to an existing note."}},
+        ["title", "content"]),
+    _fn("append_note", "Add to the end of an existing note without rewriting it (creates it if new). Prefer this over write_note when they're adding to something that already exists.",
+        {"title": {"type": "string"}, "content": {"type": "string"},
+         "folder": {"type": "string", "description": "Only used if the note is new."}},
+        ["title", "content"]),
+    _fn("read_note", "Read one note back, with what it links to and what links to it. Use it before rewriting a note, and whenever they ask what they wrote about something.",
+        {"note": {"type": "string", "description": "Title, path, or roughly what they call it."}}, ["note"]),
+    _fn("search_notes", "Search the vault BY MEANING (embeddings), not just keywords. Use this whenever they ask what they know/wrote/decided about something — their notes are the truth, don't answer from memory.",
+        {"query": {"type": "string"},
+         "limit": {"type": "integer", "description": "How many notes. Default 6."}}, ["query"]),
+    _fn("list_notes", "List notes, newest first, optionally in one folder.",
+        {"folder": {"type": "string", "description": "e.g. 'DSA'. Omit for all."},
+         "limit": {"type": "integer", "description": "Default 20."}}),
+    _fn("note_backlinks", "Show which notes link to a given note — use it to find what a topic connects to before writing more.",
+        {"title": {"type": "string"}}, ["title"]),
+    _fn("daily_note", "Today's daily note in the vault. Call with no content to read it; with content to add a line (progress, what broke, a number, a decision). This is the running log of the day.",
+        {"content": {"type": "string", "description": "Line to add. Omit to read the note."},
+         "heading": {"type": "string", "description": "Group it under a heading, e.g. 'DSA', 'Dev', 'Read'. Optional."},
+         "day": {"type": "string", "description": "YYYY-MM-DD for a past day. Default today."}}),
+    _fn("capture_research", "Park an off-topic idea/urge in the research inbox in one line, so they can keep working. Use this the moment they wander off the topic they're on — capture it, name what they're supposed to be doing, and move on. Do NOT research it now.",
+        {"text": {"type": "string", "description": "The urge, in their words."},
+         "doing": {"type": "string", "description": "What they're supposed to be on right now. Optional but useful."}},
+        ["text"]),
+    _fn("review_inbox", "Read the parked research inbox (their Sunday review), or tick items off once read.",
+        {"action": {"type": "string", "enum": ["list", "clear"], "description": "Default 'list'."},
+         "item": {"type": "string", "description": "With action='clear': words from the one item to close. Omit to close all."}}),
+    _fn("vault_status", "Where notes are being saved and whether that link works.", {}),
+    _fn("sync_vault", "Pull in notes the user edited in Obsidian and push anything that hasn't reached the vault. Use it when they say they wrote something in Obsidian, or when a note seems out of date.", {}),
 ]

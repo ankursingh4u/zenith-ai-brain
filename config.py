@@ -138,6 +138,22 @@ GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv(
 # --- Storage ---
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///brain.db").strip()
 
+# --- Obsidian vault ---------------------------------------------------------
+# Obsidian has no API — it's a folder of .md files — so notes are written into
+# somewhere the user's vault syncs from. Normally each user links their own
+# (GitHub repo or folder) with /vault; VAULT_DIR is only the fallback for a
+# self-hosted, one-person install where the bot sits next to the vault.
+VAULT_DIR = os.getenv("VAULT_DIR", "").strip()
+# With several users on one server, give each their own subfolder under it,
+# otherwise everyone writes into the same notes — the multi-tenant rule.
+VAULT_PER_USER_SUBDIR = os.getenv(
+    "VAULT_PER_USER_SUBDIR", "1").strip().lower() not in ("0", "false", "no")
+# Folder names inside the vault. Changing these changes where new notes land;
+# notes already written stay where they are.
+VAULT_DAILY_FOLDER = os.getenv("VAULT_DAILY_FOLDER", "Daily").strip()
+VAULT_INBOX_FOLDER = os.getenv("VAULT_INBOX_FOLDER", "Inbox").strip()
+VAULT_DEFAULT_FOLDER = os.getenv("VAULT_DEFAULT_FOLDER", "Notes").strip()
+
 # --- Scheduler (Phase 4) ---
 # Timezone for all scheduled jobs. India by default.
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Kolkata").strip()

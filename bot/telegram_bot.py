@@ -21,6 +21,7 @@ import db
 from bot.auth import is_allowed
 from brain import agent, routing, speech, tools, vision
 from integrations import drive, gservice, mailbox, oauth, sheets
+from integrations import vault as vaultmod
 from scheduler.jobs import run_daily_check, start_scheduler
 
 log = logging.getLogger("brain.bot")
@@ -44,6 +45,7 @@ WELCOME = (
     "/sheets — see or switch your connected Sheets\n"
     "/accounts — switch or add Google accounts (Gmail/Drive/Docs)\n"
     "/addmail — connect an email mailbox (Migadu, Zoho, IMAP)\n"
+    "/vault — connect your Obsidian vault (notes as real markdown)\n"
     "/status — see what you've connected\n"
     "/help — show this help again\n\n"
     "What can I do for you?"
@@ -639,8 +641,95 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"📁 Drive folder: {'✅ connected' if folder_id else '➖ not set (optional)'}",
         "📧 Google accounts (email/calendar/docs/drive): "
         + (", ".join(a.email for a in accts) if accts else "none — /connect to add"),
+        "🗂 " + vaultmod.status(uid) + f" ({db.count_notes(uid)} note(s))",
     ]
     await update.message.reply_text("\n".join(lines))
+
+
+_VAULT_HELP = (
+    "🗂 Obsidian vault — where your notes are written as real .md files.\n\n"
+    "Obsidian has no API (it's just a folder of markdown), so I write into a "
+    "place your vault already syncs from:\n\n"
+    "1️⃣ GitHub (works no matter where I'm running — recommended)\n"
+    "   /vault github owner/repo <token> [branch] [subfolder]\n"
+    "   • Make a repo (private is fine) — your vault, or a folder inside it.\n"
+    "   • Token: github.com/settings/personal-access-tokens → Fine-grained, "
+    "only that repo, permission Contents: Read and write.\n"
+    "   • In Obsidian install the community plugin 'Obsidian Git' and point it "
+    "at the same repo — it pulls my notes down on a timer.\n\n"
+    "2️⃣ A folder on the machine I'm running on (or any synced folder — "
+    "Syncthing, Dropbox, iCloud, Drive desktop)\n"
+    "   /vault local D:\\Obsidian\\MyVault\n\n"
+    "Other: /vault status · /vault sync · /vault unlink\n"
+    "Your token is encrypted and I delete the message that contains it."
+)
+
+
+async def vault_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Link / inspect the user's Obsidian vault. Handles the token like a password."""
+    if not await _gate(update):
+        return
+    uid = update.effective_user.id
+    chat_id = update.effective_chat.id
+    db.get_or_create_user(uid, update.effective_user.full_name)
+    args = ctx.args or []
+    sub = (args[0].lower() if args else "")
+
+    # A GitHub token is a credential — get it off the screen before anything else.
+    if sub == "github":
+        try:
+            await ctx.bot.delete_message(chat_id, update.message.message_id)
+        except Exception:  # noqa: BLE001 — deletion is a courtesy, not a guarantee
+            pass
+
+    async def say(text: str) -> None:
+        await ctx.bot.send_message(chat_id, text, disable_web_page_preview=True)
+
+    if not sub or sub == "help":
+        return await say(_VAULT_HELP)
+
+    if sub == "status":
+        return await say(await asyncio.to_thread(tools.vault_status, uid))
+
+    if sub == "sync":
+        await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
+        return await say(await asyncio.to_thread(tools.sync_vault, uid))
+
+    if sub == "unlink":
+        gone = db.remove_vault_link(uid)
+        return await say("🔌 Vault unlinked. Your notes and files are untouched."
+                         if gone else "No vault was linked.")
+
+    if sub == "github":
+        if len(args) < 3:
+            return await say("Send: /vault github owner/repo <token> [branch] [subfolder]")
+        repo, token = args[1], args[2]
+        branch = args[3] if len(args) > 3 else "main"
+        subfolder = args[4] if len(args) > 4 else None
+        db.set_vault_link(uid, "github", repo, branch, subfolder,
+                          crypto.encrypt(token), label=repo)
+        await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
+        ok, detail = await asyncio.to_thread(vaultmod.check, uid)
+        if not ok:
+            db.remove_vault_link(uid)
+            return await say(f"⚠️ Couldn't use that repo, so I didn't save the link:\n{detail}")
+        return await say(f"✅ Vault linked: {detail}\n"
+                         f"(I deleted your token message. It's encrypted at rest.)\n\n"
+                         f"Now install 'Obsidian Git' in Obsidian on the same repo, "
+                         f"and try: \"note this: …\"")
+
+    if sub == "local":
+        if len(args) < 2:
+            return await say("Send: /vault local <folder path>")
+        folder = " ".join(args[1:]).strip().strip('"')
+        db.set_vault_link(uid, "local", folder, "main", None, None, label=folder)
+        ok, detail = await asyncio.to_thread(vaultmod.check, uid)
+        if not ok:
+            db.remove_vault_link(uid)
+            return await say(f"⚠️ Can't use that folder, so I didn't save it:\n{detail}")
+        return await say(f"✅ Vault linked: {detail}\nOpen that folder as a vault in Obsidian.")
+
+    return await say(_VAULT_HELP)
 
 
 # --- Messages -------------------------------------------------------------
@@ -1004,6 +1093,7 @@ async def _post_init(app: Application) -> None:
         BotCommand("sheets", "See or switch your connected Sheets"),
         BotCommand("accounts", "Switch or add Google accounts"),
         BotCommand("addmail", "Connect an email mailbox (Migadu, Zoho, IMAP)"),
+        BotCommand("vault", "Connect your Obsidian vault"),
         BotCommand("status", "See what you have connected"),
         BotCommand("version", "Which build is running + my view of your sheet"),
         BotCommand("whoami", "Show my Telegram ID"),
@@ -1028,6 +1118,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("hidemenu", hide_menu))
     app.add_handler(CommandHandler("addmail", addmail))
+    app.add_handler(CommandHandler("vault", vault_cmd))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("version", version))
     app.add_handler(CommandHandler("checknow", checknow))

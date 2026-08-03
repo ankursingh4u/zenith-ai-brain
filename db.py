@@ -283,6 +283,56 @@ class ActionLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
+class VaultLink(Base):
+    """Where this user's Obsidian vault lives, so notes land somewhere they sync.
+
+    Obsidian is a folder of markdown files, not a service — there is no API to
+    call. So the bot writes real .md files into a place the user's vault already
+    syncs from: a GitHub repo (Obsidian Git plugin) or a folder on the machine
+    running the bot. One link per user; the token is Fernet-encrypted.
+    """
+    __tablename__ = "vault_links"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    telegram_id: Mapped[int] = mapped_column(
+        ForeignKey("users.telegram_id"), index=True, nullable=False
+    )
+    kind: Mapped[str] = mapped_column(String(12), default="local")   # local | github
+    # github: "owner/repo" + branch. local: base_path is the folder.
+    repo: Mapped[Optional[str]] = mapped_column(String(255))
+    branch: Mapped[str] = mapped_column(String(80), default="main")
+    base_path: Mapped[Optional[str]] = mapped_column(Text)   # subfolder inside the vault/repo
+    token_enc: Mapped[Optional[str]] = mapped_column(Text)   # encrypted PAT (github only)
+    label: Mapped[Optional[str]] = mapped_column(String(120))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Note(Base):
+    """One markdown note, mirrored to the user's vault.
+
+    The body is kept here as well as in the vault on purpose: recall has to work
+    when GitHub is down or nothing is linked yet, and searching thousands of
+    remote files per question would be unusable. The vault is the copy Obsidian
+    opens; this is the copy the bot thinks with.
+    """
+    __tablename__ = "notes"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    telegram_id: Mapped[int] = mapped_column(
+        ForeignKey("users.telegram_id"), index=True, nullable=False
+    )
+    path: Mapped[str] = mapped_column(String(400), nullable=False, index=True)  # "DSA/Sliding Window.md"
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    body: Mapped[str] = mapped_column(Text, default="")          # markdown, no frontmatter
+    tags: Mapped[Optional[str]] = mapped_column(Text)            # comma-separated
+    links: Mapped[Optional[str]] = mapped_column(Text)           # comma-separated [[wikilinks]]
+    # Same trick as MemoryVector — a JSON array of floats, scanned in Python.
+    vector: Mapped[Optional[str]] = mapped_column(Text)
+    remote_sha: Mapped[Optional[str]] = mapped_column(String(64))  # github blob sha, for updates
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
 class Account(Base):
     """A bill / card the user tracks: when its statement arrives and when it's due."""
     __tablename__ = "accounts"
@@ -1684,3 +1734,185 @@ def recent_turns(telegram_id: int, limit: int = 12) -> list[dict]:
             .limit(limit)
         ).all()
     return [{"role": r.role, "content": r.content} for r in reversed(rows)]
+
+
+# --- Vault link (where the user's Obsidian vault lives) -------------------
+def set_vault_link(telegram_id: int, kind: str, repo: str | None = None,
+                   branch: str = "main", base_path: str | None = None,
+                   token_enc: str | None = None, label: str | None = None) -> None:
+    """Point this user at one vault. Re-linking replaces the old one."""
+    with session() as s:
+        row = s.scalars(select(VaultLink).where(
+            VaultLink.telegram_id == telegram_id)).first()
+        if row is None:
+            row = VaultLink(telegram_id=telegram_id)
+            s.add(row)
+        row.kind = kind
+        row.repo = repo
+        row.branch = branch or "main"
+        row.base_path = (base_path or "").strip("/") or None
+        # Keep the stored token when re-linking without one (e.g. changing folder).
+        if token_enc:
+            row.token_enc = token_enc
+        row.label = label
+        s.commit()
+
+
+def get_vault_link(telegram_id: int) -> "VaultLink | None":
+    with session() as s:
+        row = s.scalars(select(VaultLink).where(
+            VaultLink.telegram_id == telegram_id)).first()
+        if row is not None:
+            s.expunge(row)
+        return row
+
+
+def remove_vault_link(telegram_id: int) -> bool:
+    """Unlink the vault. The vault's own files are never touched."""
+    with session() as s:
+        row = s.scalars(select(VaultLink).where(
+            VaultLink.telegram_id == telegram_id)).first()
+        if row is None:
+            return False
+        s.delete(row)
+        s.commit()
+        return True
+
+
+# --- Notes ----------------------------------------------------------------
+def upsert_note(telegram_id: int, path: str, title: str, body: str,
+                tags: str | None = None, links: str | None = None,
+                vector: str | None = None, remote_sha: str | None = None) -> "Note":
+    """Create or update one note by path. Returns the stored row (detached)."""
+    with session() as s:
+        row = s.scalars(select(Note).where(
+            Note.telegram_id == telegram_id, Note.path == path)).first()
+        if row is None:
+            row = Note(telegram_id=telegram_id, path=path, title=title)
+            s.add(row)
+        row.title = title
+        row.body = body
+        row.tags = tags
+        row.links = links
+        # Only overwrite these when we actually have a new value — a plain edit
+        # shouldn't wipe the embedding or the remote sha it still matches.
+        if vector is not None:
+            row.vector = vector
+        if remote_sha is not None:
+            row.remote_sha = remote_sha
+        row.updated_at = datetime.utcnow()
+        s.commit()
+        s.refresh(row)
+        s.expunge(row)
+        return row
+
+
+def get_note(telegram_id: int, path: str) -> "Note | None":
+    with session() as s:
+        row = s.scalars(select(Note).where(
+            Note.telegram_id == telegram_id, Note.path == path)).first()
+        if row is not None:
+            s.expunge(row)
+        return row
+
+
+def find_notes(telegram_id: int, text: str, limit: int = 20) -> list["Note"]:
+    """Notes whose title, path or body mentions `text` — title matches first."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    like = f"%{text}%"
+    with session() as s:
+        rows = s.scalars(
+            select(Note)
+            .where(Note.telegram_id == telegram_id,
+                   Note.title.ilike(like) | Note.path.ilike(like) | Note.body.ilike(like))
+            .order_by(Note.updated_at.desc())
+            .limit(limit * 3)
+        ).all()
+        for r in rows:
+            s.expunge(r)
+    scored = sorted(rows, key=lambda r: (
+        0 if text.lower() == (r.title or "").lower() else
+        1 if text.lower() in (r.title or "").lower() else 2))
+    return scored[:limit]
+
+
+def list_notes(telegram_id: int, folder: str | None = None,
+               limit: int = 50) -> list["Note"]:
+    """Most recently touched notes, optionally inside one folder."""
+    with session() as s:
+        stmt = select(Note).where(Note.telegram_id == telegram_id)
+        if folder:
+            stmt = stmt.where(Note.path.ilike(f"{folder.strip('/')}/%"))
+        rows = s.scalars(stmt.order_by(Note.updated_at.desc()).limit(limit)).all()
+        for r in rows:
+            s.expunge(r)
+        return list(rows)
+
+
+def all_notes(telegram_id: int, limit: int = 2000) -> list["Note"]:
+    """Every note, for a full scan (semantic search, backlink index, export)."""
+    with session() as s:
+        rows = s.scalars(
+            select(Note).where(Note.telegram_id == telegram_id)
+            .order_by(Note.updated_at.desc()).limit(limit)
+        ).all()
+        for r in rows:
+            s.expunge(r)
+        return list(rows)
+
+
+def count_notes(telegram_id: int) -> int:
+    with session() as s:
+        return int(s.scalar(select(func.count()).select_from(Note).where(
+            Note.telegram_id == telegram_id)) or 0)
+
+
+def remove_note(telegram_id: int, path: str) -> bool:
+    """Drop a note from the local index. Used by sync when a file is gone
+    from the vault — there is deliberately no tool that deletes vault files."""
+    with session() as s:
+        row = s.scalars(select(Note).where(
+            Note.telegram_id == telegram_id, Note.path == path)).first()
+        if row is None:
+            return False
+        s.delete(row)
+        s.commit()
+        return True
+
+
+def set_note_pushed(telegram_id: int, path: str, sha: str | None) -> None:
+    """Record whether this note actually reached the vault.
+
+    Set unconditionally, including back to None: a push that failed has to be
+    retryable, and upsert_note deliberately leaves the sha alone when it isn't
+    told about one.
+    """
+    with session() as s:
+        row = s.scalars(select(Note).where(
+            Note.telegram_id == telegram_id, Note.path == path)).first()
+        if row is None:
+            return
+        row.remote_sha = sha
+        s.commit()
+
+
+def reparent_node(telegram_id: int, node_id: int, parent_id: int | None,
+                  track: str | None = None) -> bool:
+    """Move a plan node under a different parent, keeping its progress/streak.
+
+    Habits created before their 'Life' track existed sit at the root and get
+    rendered as if each were a track of its own; this tidies them without
+    deleting and re-adding them, which would reset the streak.
+    """
+    with session() as s:
+        row = s.scalars(select(Task).where(
+            Task.telegram_id == telegram_id, Task.id == node_id)).first()
+        if row is None or row.id == parent_id:
+            return False
+        row.parent_id = parent_id
+        if track is not None:
+            row.track = track
+        s.commit()
+        return True
